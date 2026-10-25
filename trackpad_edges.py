@@ -87,6 +87,7 @@ POLL_INTERVAL = 2.0       # how often to notice brightness keys / KDE slider mov
 # Plasma's PowerDevil (and GNOME) set their own remembered brightness a few
 # seconds into a session, so the saved level is put back after that.
 LOGIN_RESTORE_DELAYS = (4.0, 10.0)
+SETTLE_TIME = 1.5         # KWin fades brightness; ignore readings this long after a change
 
 # ---- Built-in panel brightness curve ----
 # amdgpu runs the requested `brightness` value through a firmware gamma curve,
@@ -362,14 +363,16 @@ def sync_kde(fraction):
     the moment the desktop starts. Writing sysfs directly never updates that
     copy, so without this the desktop opens at KWin's stale (usually darker)
     level until our login restore kicks in.
+
+    True if Plasma took the change (it then drives the panel itself).
     """
     user = logged_in_user()
     if not user or not plasma_running(user[0]):
-        return
+        return False
     try:
         path = _kde_displays.get(user[0]) or kde_internal_display(user)
         if not path:
-            return
+            return False
         r = subprocess.run(as_user(                # flags=1: no OSD popup
             user, "dbus-send", "--print-reply", "--dest=org.kde.ScreenBrightness",
             path, "org.kde.ScreenBrightness.Display.SetBrightness",
@@ -377,10 +380,11 @@ def sync_kde(fraction):
             capture_output=True, timeout=5)
         if r.returncode == 0:
             _kde_displays[user[0]] = path
-        else:
-            _kde_displays.pop(user[0], None)       # display renumbered: look it up again
+            return True
+        _kde_displays.pop(user[0], None)           # display renumbered: look it up again
     except (OSError, subprocess.SubprocessError) as e:
         log(f"could not update Plasma's brightness: {e}")
+    return False
 
 
 def backlight():
@@ -610,6 +614,7 @@ class Screens:
         self.known = None             # panel nits as last set or seen
         self.save_at = None
         self.session_uid = None
+        self.driven_at = 0.0          # when we last set the panel
         self.asleep_for = self._suspended()
         if start:
             threading.Thread(target=self._worker, daemon=True).start()
@@ -690,7 +695,7 @@ class Screens:
                 return                            # don't learn the desktop's value
 
         t = self._panel_nits()                    # brightness keys / desktop slider
-        if t is not None:
+        if t is not None and now - self.driven_at > SETTLE_TIME:
             if self.known is None:
                 self.known = t
             elif abs(t - self.known) > SCREEN_NITS["internal"] * 0.01:
@@ -803,13 +808,15 @@ class Screens:
         if bl is None:
             return
         self._maybe_rescan()
-        t = self._panel_nits(bl)
+        if self.known is not None and time.time() - self.driven_at < SETTLE_TIME:
+            t = self.known                  # mid-swipe: the panel may still be fading
+        else:
+            t = self._panel_nits(bl)        # follows KDE's own brightness keys too
         if t is None:
             return                          # panel vanished; nothing to drive
         t_min, t_max = self._range()
         t = min(t_max, max(t_min, t + n * BRIGHTNESS_STEP * t_max))
         self._drive(bl, t)
-        self._sync_kde()                   # keeps the tray slider in step
         show_osd(round(t / t_max * 100))
         self._remember(t)
 
@@ -826,24 +833,22 @@ class Screens:
         log(f"restoring brightness: {t:.0f} nits")
         self.synced.clear()                       # a resumed monitor may have reset
         self._drive(bl, t)
-        self._sync_kde()
-
-    def _sync_kde(self):
-        bl = backlight()
-        if bl is None or self.known is None:
-            return
-        curve = self._get_curve(bl)
-        sync_kde(curve.requested(self.known, SCREEN_NITS["internal"]) / curve.max)
 
     def _drive(self, bl, t):
-        want = max(1, round(self._get_curve(bl).requested(t, SCREEN_NITS["internal"])))
-        try:
-            cur = int(Path(bl, "brightness").read_text())
-            if want != cur:                # skip a pointless sysfs write
-                Path(bl, "brightness").write_text(str(want))
-        except OSError as e:
-            log(f"panel brightness write failed: {e}")
+        curve = self._get_curve(bl)
+        want = max(1, round(curve.requested(t, SCREEN_NITS["internal"])))
+        # On Plasma, KWin owns the backlight: hand it the level so the tray
+        # slider and KWin's saved brightness follow. Writing sysfs as well
+        # would fight KWin's fade. Elsewhere (or at the login screen) write it.
+        if not sync_kde(want / curve.max):
+            try:
+                cur = int(Path(bl, "brightness").read_text())
+                if want != cur:                # skip a pointless sysfs write
+                    Path(bl, "brightness").write_text(str(want))
+            except OSError as e:
+                log(f"panel brightness write failed: {e}")
         self.known = t
+        self.driven_at = time.time()
         self._push_all(t)
 
     def _push_all(self, t, only_unsynced=False):

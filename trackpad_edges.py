@@ -80,6 +80,7 @@ SCREEN_NITS = {
 BRIGHTNESS_STEP = 0.05   # each step = 5% of the slider
 MIN_BRIGHTNESS = 0.01    # dimmest allowed = 1% on the slider
 DDC_RETRY_BACKOFF = 30.0 # seconds to ignore a monitor whose setvcp keeps failing
+DDCUTIL_RESCAN = 300.0   # min seconds between slow `ddcutil detect` fallbacks
 
 # ---- Remembering brightness ----
 REMEMBER_BRIGHTNESS = True
@@ -389,6 +390,55 @@ def sync_kde(fraction):
     return False
 
 
+def internal_connectors():
+    """Connector names of built-in panels, as KWin spells them (e.g. 'eDP-1')."""
+    return {re.sub(r"^card\d+-", "", os.path.basename(c))
+            for c in glob.glob(f"{DRM_DIR}/card*-*")
+            if re.search(r"eDP|LVDS|DSI", os.path.basename(c))}
+
+
+def write_kwin_brightness(fraction):
+    """Set the built-in panel's brightness in ~/.config/kwinoutputconfig.json.
+
+    Only for users without a running Plasma session (e.g. at the login
+    screen): KWin reads the file when the desktop starts, so a swipe at the
+    login screen carries over instead of the desktop opening at its old level.
+    A running KWin would overwrite the file; sync_kde() covers that case.
+    """
+    names = internal_connectors()
+    if not names:
+        return
+    for user in pwd.getpwall():
+        if user.pw_uid < 1000 or plasma_running(user.pw_uid):
+            continue
+        path = Path(user.pw_dir, ".config", "kwinoutputconfig.json")
+        try:
+            st = path.stat()
+            doc = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        changed = False
+        for section in doc if isinstance(doc, list) else []:
+            if not isinstance(section, dict) or section.get("name") != "outputs":
+                continue
+            for out in section.get("data", []):
+                if (isinstance(out, dict) and out.get("connectorName") in names
+                        and "brightness" in out and out["brightness"] != round(fraction, 4)):
+                    out["brightness"] = round(fraction, 4)
+                    changed = True
+        if not changed:
+            continue
+        tmp = path.with_name(path.name + ".trackpad-edges.tmp")
+        try:
+            tmp.write_text(json.dumps(doc, indent=4, ensure_ascii=False) + "\n")
+            os.chown(tmp, st.st_uid, st.st_gid)
+            os.chmod(tmp, st.st_mode & 0o7777)
+            tmp.replace(path)                     # KWin never sees a half-written file
+        except OSError as e:
+            log(f"could not update {path}: {e}")
+            tmp.unlink(missing_ok=True)
+
+
 def backlight():
     """Path of the best backlight device for the built-in panel, or None."""
     best = None
@@ -607,6 +657,7 @@ class Screens:
         self.externals = []          # [(i2c bus number, peak nits or None)]
         self.scan_how = None
         self.last_scan = 0.0
+        self.last_ddcutil = -DDCUTIL_RESCAN
         self.ddc_dead = {}            # {bus: timestamp to retry at}
         self.synced = set()           # buses already sent the current level
         self.ddc_fails = {}           # {bus: failed setvcp in a row}
@@ -684,6 +735,7 @@ class Screens:
         if self.save_at and now >= self.save_at:
             self.save_at = None
             save_state(self.saved)
+            self._sync_kwin_files()
 
         user = logged_in_user()                   # someone just logged in:
         uid = user[0] if user else None           # wait out the desktop's own restore
@@ -712,6 +764,16 @@ class Screens:
         if self.known is not None:
             self._push_all(self.known, only_unsynced=True)
 
+    def _sync_kwin_files(self):
+        """Saved level -> KWin's config of every user not in a Plasma session."""
+        bl = backlight()
+        if bl is None or self.saved is None:
+            return
+        curve = self._get_curve(bl)
+        t_min, t_max, _ = self._range(bl)
+        t = min(t_max, max(t_min, self.saved))
+        write_kwin_brightness(curve.requested(t, SCREEN_NITS["internal"]) / curve.max)
+
     def _remember(self, t):
         if REMEMBER_BRIGHTNESS:
             self.saved = t
@@ -725,7 +787,11 @@ class Screens:
     def _scan(self):
         self.last_scan = time.time()
         found, how = self._scan_sysfs(), "sysfs"
-        if not found:                             # fall back to asking ddcutil
+        # Fall back to asking ddcutil, but rarely: `ddcutil detect` can take
+        # seconds, and with no monitor plugged in it would otherwise run on
+        # every swipe and hold up the brightness change.
+        if not found and self.last_scan - self.last_ddcutil > DDCUTIL_RESCAN:
+            self.last_ddcutil = self.last_scan
             found, how = self._scan_ddcutil(), "ddcutil detect"
         self._set_externals(found, how)
 

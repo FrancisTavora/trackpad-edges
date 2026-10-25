@@ -816,8 +816,8 @@ class Screens:
             return                          # panel vanished; nothing to drive
         t_min, t_max = self._range()
         t = min(t_max, max(t_min, t + n * BRIGHTNESS_STEP * t_max))
-        self._drive(bl, t)
-        show_osd(round(t / t_max * 100))
+        fraction = self._drive(bl, t)
+        show_osd(round(fraction * 100))     # the same % as Plasma's brightness slider
         self._remember(t)
 
     def restore(self):
@@ -850,6 +850,7 @@ class Screens:
         self.known = t
         self.driven_at = time.time()
         self._push_all(t)
+        return want / curve.max
 
     def _push_all(self, t, only_unsynced=False):
         now = time.time()

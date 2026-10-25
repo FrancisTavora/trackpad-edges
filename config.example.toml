@@ -24,8 +24,8 @@ volume_backend = "auto"
 volume_step = 5         # percent per step (wpctl / pactl only)
 
 # Brightness
-brightness_step = 0.05      # each step = 5% of the range
-min_nits_fraction = 0.02    # dimmest allowed = 2% of the range
+brightness_step = 0.05      # each step = 5% on the brightness slider
+min_brightness = 0.01       # dimmest allowed = 1% on the slider
 remember_brightness = true  # restore the last level after reboot/login/resume
 
 # Peak brightness in nits, so the laptop and external monitors look equally

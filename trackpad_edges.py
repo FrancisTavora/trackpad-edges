@@ -75,8 +75,10 @@ VOLUME_STEP = 5          # percent per step for wpctl / pactl
 SCREEN_NITS = {
     "internal": 400,
 }
-BRIGHTNESS_STEP = 0.05   # each step = 5% of the shared maximum
-MIN_NITS_FRACTION = 0.02 # bottom of the shared range = 2% of its ceiling
+# Steps follow the panel's own brightness curve, so one step is the same
+# change on Plasma's slider (and looks even to the eye) at any level.
+BRIGHTNESS_STEP = 0.05   # each step = 5% of the slider
+MIN_BRIGHTNESS = 0.01    # dimmest allowed = 1% on the slider
 DDC_RETRY_BACKOFF = 30.0 # seconds to ignore a monitor whose setvcp keeps failing
 
 # ---- Remembering brightness ----
@@ -104,7 +106,7 @@ PANEL_SETTLE = 0.06       # amdgpu applies a new backlight value asynchronously
 _CONFIGURABLE = (
     "TOUCHPAD_NAME", "LEFT_EDGE", "RIGHT_EDGE", "EDGE_WIDTH", "TOP_DEAD_ZONE",
     "ACTIVATION", "SENSITIVITY", "VOLUME_BACKEND", "VOLUME_STEP",
-    "BRIGHTNESS_STEP", "MIN_NITS_FRACTION", "REMEMBER_BRIGHTNESS",
+    "BRIGHTNESS_STEP", "MIN_BRIGHTNESS", "REMEMBER_BRIGHTNESS",
 )
 
 
@@ -783,11 +785,13 @@ class Screens:
             log(f"ddcutil detect saw no monitors. stdout={r.stdout[:300]!r} stderr={r.stderr[:300]!r}")
         return found
 
-    def _range(self):
+    def _range(self, bl):
+        """(dimmest nits, brightest nits, gamma) of the shared range."""
         peak_int = SCREEN_NITS["internal"]
         peaks = [peak_int] + [p for _, p in self.externals if p]
         t_max = max(peaks)                 # brightest screen sets the ceiling;
-        return t_max * MIN_NITS_FRACTION, t_max   # a dimmer monitor just saturates
+        gamma = self._get_curve(bl).gamma  # a dimmer monitor just saturates
+        return t_max * MIN_BRIGHTNESS ** gamma, t_max, gamma
 
     def _panel_nits(self, bl=None):
         bl = bl or backlight()
@@ -814,8 +818,10 @@ class Screens:
             t = self._panel_nits(bl)        # follows KDE's own brightness keys too
         if t is None:
             return                          # panel vanished; nothing to drive
-        t_min, t_max = self._range()
-        t = min(t_max, max(t_min, t + n * BRIGHTNESS_STEP * t_max))
+        _, t_max, gamma = self._range(bl)
+        level = (max(t, 0.0) / t_max) ** (1 / gamma)   # nits -> slider position
+        level = min(1.0, max(MIN_BRIGHTNESS, level + n * BRIGHTNESS_STEP))
+        t = t_max * level ** gamma
         fraction = self._drive(bl, t)
         show_osd(round(fraction * 100))     # the same % as Plasma's brightness slider
         self._remember(t)
@@ -828,7 +834,7 @@ class Screens:
         if bl is None:
             return
         self._maybe_rescan()
-        t_min, t_max = self._range()
+        t_min, t_max, _ = self._range(bl)
         t = min(t_max, max(t_min, self.saved))    # keeps self.saved for a bigger monitor
         log(f"restoring brightness: {t:.0f} nits")
         self.synced.clear()                       # a resumed monitor may have reset

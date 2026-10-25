@@ -333,6 +333,48 @@ def show_osd(percent):
             f"int32:{percent}"))
 
 
+def kde_internal_display(user):
+    """D-Bus path of Plasma's built-in screen (org.kde.ScreenBrightness), or None."""
+    def call(*args):
+        r = subprocess.run(as_user(user, "dbus-send", "--print-reply",
+                                   "--dest=org.kde.ScreenBrightness", *args),
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout if r.returncode == 0 else ""
+
+    out = call("/org/kde/ScreenBrightness", "org.freedesktop.DBus.Properties.Get",
+               "string:org.kde.ScreenBrightness", "string:DisplaysDBusNames")
+    for name in re.findall(r'string "([^"]+)"', out):
+        path = f"/org/kde/ScreenBrightness/{name}"
+        if "boolean true" in call(path, "org.freedesktop.DBus.Properties.Get",
+                                  "string:org.kde.ScreenBrightness.Display",
+                                  "string:IsInternal"):
+            return path
+    return None
+
+
+def sync_kde(fraction):
+    """Tell Plasma the panel's brightness (0..1 of the sysfs range).
+
+    KWin keeps its own copy in ~/.config/kwinoutputconfig.json and applies it
+    the moment the desktop starts. Writing sysfs directly never updates that
+    copy, so without this the desktop opens at KWin's stale (usually darker)
+    level until our login restore kicks in.
+    """
+    user = logged_in_user()
+    if not user or not plasma_running(user[0]):
+        return
+    try:
+        path = kde_internal_display(user)
+        if path:                                  # flags=1: no OSD popup
+            subprocess.run(as_user(
+                user, "dbus-send", "--type=method_call", "--dest=org.kde.ScreenBrightness",
+                path, "org.kde.ScreenBrightness.Display.SetBrightness",
+                f"int32:{round(fraction * 10000)}", "uint32:1"),
+                capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not update Plasma's brightness: {e}")
+
+
 def backlight():
     """Path of the best backlight device for the built-in panel, or None."""
     best = None
@@ -627,6 +669,7 @@ class Screens:
         if self.save_at and now >= self.save_at:
             self.save_at = None
             save_state(self.saved)
+            self._sync_kde()
 
         user = logged_in_user()                   # someone just logged in:
         uid = user[0] if user else None           # wait out the desktop's own restore
@@ -775,6 +818,14 @@ class Screens:
         log(f"restoring brightness: {t:.0f} nits")
         self.synced.clear()                       # a resumed monitor may have reset
         self._drive(bl, t)
+        self._sync_kde()
+
+    def _sync_kde(self):
+        bl = backlight()
+        if bl is None or self.known is None:
+            return
+        curve = self._get_curve(bl)
+        sync_kde(curve.requested(self.known, SCREEN_NITS["internal"]) / curve.max)
 
     def _drive(self, bl, t):
         want = max(1, round(self._get_curve(bl).requested(t, SCREEN_NITS["internal"])))

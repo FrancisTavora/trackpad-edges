@@ -352,6 +352,9 @@ def kde_internal_display(user):
     return None
 
 
+_kde_displays = {}                                # {uid: D-Bus path of the built-in screen}
+
+
 def sync_kde(fraction):
     """Tell Plasma the panel's brightness (0..1 of the sysfs range).
 
@@ -364,13 +367,18 @@ def sync_kde(fraction):
     if not user or not plasma_running(user[0]):
         return
     try:
-        path = kde_internal_display(user)
-        if path:                                  # flags=1: no OSD popup
-            subprocess.run(as_user(
-                user, "dbus-send", "--type=method_call", "--dest=org.kde.ScreenBrightness",
-                path, "org.kde.ScreenBrightness.Display.SetBrightness",
-                f"int32:{round(fraction * 10000)}", "uint32:1"),
-                capture_output=True, timeout=5)
+        path = _kde_displays.get(user[0]) or kde_internal_display(user)
+        if not path:
+            return
+        r = subprocess.run(as_user(                # flags=1: no OSD popup
+            user, "dbus-send", "--print-reply", "--dest=org.kde.ScreenBrightness",
+            path, "org.kde.ScreenBrightness.Display.SetBrightness",
+            f"int32:{round(fraction * 10000)}", "uint32:1"),
+            capture_output=True, timeout=5)
+        if r.returncode == 0:
+            _kde_displays[user[0]] = path
+        else:
+            _kde_displays.pop(user[0], None)       # display renumbered: look it up again
     except (OSError, subprocess.SubprocessError) as e:
         log(f"could not update Plasma's brightness: {e}")
 
@@ -669,7 +677,6 @@ class Screens:
         if self.save_at and now >= self.save_at:
             self.save_at = None
             save_state(self.saved)
-            self._sync_kde()
 
         user = logged_in_user()                   # someone just logged in:
         uid = user[0] if user else None           # wait out the desktop's own restore
@@ -802,6 +809,7 @@ class Screens:
         t_min, t_max = self._range()
         t = min(t_max, max(t_min, t + n * BRIGHTNESS_STEP * t_max))
         self._drive(bl, t)
+        self._sync_kde()                   # keeps the tray slider in step
         show_osd(round(t / t_max * 100))
         self._remember(t)
 

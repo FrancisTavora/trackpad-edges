@@ -1,5 +1,6 @@
 [Unit]
 Description=Touchpad edge swipes (volume/brightness)
+After=systemd-modules-load.service
 
 [Service]
 ExecStart=/usr/bin/python3 /usr/local/bin/trackpad_edges.py
@@ -8,6 +9,7 @@ RestartSec=2
 # ddcutil needs a writable cache dir; the service has no $HOME.
 RuntimeDirectory=ddcutil-cache
 Environment=XDG_CACHE_HOME=/run/ddcutil-cache
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

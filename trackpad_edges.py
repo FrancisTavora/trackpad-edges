@@ -14,13 +14,15 @@ The last brightness is remembered and put back after a reboot, after login
 (KDE and GNOME restore their own value then), after resume and when a monitor
 is plugged in.
 
-Every setting below can be overridden in /etc/trackpad-edges/config.toml
-(see config.example.toml).
+Every setting below can be overridden in /etc/trackpad-edges.conf
+(see trackpad-edges.conf.example).
 
 Also usable by hand:
+  sudo trackpad_edges.py --check       # what it found and how it will act
   sudo trackpad_edges.py --status      # what nits each screen is at right now
   sudo trackpad_edges.py --calibrate   # re-fit the built-in panel's curve
 """
+import configparser
 import glob
 import json
 import math
@@ -40,11 +42,12 @@ from evdev import InputDevice, ecodes, list_devices
 def log(msg):
     print(msg, flush=True)                        # shows up in `journalctl -u trackpad-edges`
 
-CONFIG_FILE = os.environ.get("TRACKPAD_EDGES_CONFIG", "/etc/trackpad-edges/config.toml")
+CONFIG_FILE = os.environ.get("TRACKPAD_EDGES_CONFIG", "/etc/trackpad-edges.conf")
+OLD_CONFIG_FILE = "/etc/trackpad-edges/config.toml"   # pre-1.1 TOML config
 
 # ---- Which touchpad ----
 # Regex matched against the evdev device name (`sudo libinput list-devices`).
-# Empty, or nothing matches = the first device with "touchpad" in its name.
+# Empty, or nothing matches = the touchpad found by its capabilities.
 TOUCHPAD_NAME = ""
 
 # ---- What each edge does: "volume", "brightness" or "none" ----
@@ -58,9 +61,14 @@ ACTIVATION = 0.03        # vertical travel before the first step
 SENSITIVITY = 0.018      # vertical travel per step
 
 # ---- Volume ----
-# "auto" = KDE's own shortcut (shows the OSD) on Plasma, else wpctl, else pactl.
-VOLUME_BACKEND = "auto"  # "auto", "kde", "wpctl" or "pactl"
+# "auto" = KDE's own shortcut (shows the OSD) on Plasma, the volume keys on
+# GNOME (shows GNOME's OSD), else wpctl, else pactl.
+VOLUME_BACKEND = "auto"  # "auto", "kde", "keys", "wpctl" or "pactl"
 VOLUME_STEP = 5          # percent per step for wpctl / pactl
+
+# ---- Popups ----
+# "auto" = Plasma's OSD on KDE, GNOME's OSD on GNOME, notify-send elsewhere.
+POPUP = "auto"           # "auto" or "none"
 
 # ---- Brightness matching ----
 # Every screen is driven to the SAME nits. The shared range tops out at the
@@ -103,43 +111,162 @@ PANEL_CURVE_FILE = "/var/lib/trackpad-edges/panel.json"
 PANEL_CAL_STEPS = (1.0, 0.75, 0.5, 0.25)   # fractions of range to sample
 PANEL_SETTLE = 0.06       # amdgpu applies a new backlight value asynchronously
 
-# config.toml keys -> the settings above (same names, lower case)
+# config keys -> the settings above (same names, lower case)
 _CONFIGURABLE = (
     "TOUCHPAD_NAME", "LEFT_EDGE", "RIGHT_EDGE", "EDGE_WIDTH", "TOP_DEAD_ZONE",
-    "ACTIVATION", "SENSITIVITY", "VOLUME_BACKEND", "VOLUME_STEP",
+    "ACTIVATION", "SENSITIVITY", "VOLUME_BACKEND", "VOLUME_STEP", "POPUP",
     "BRIGHTNESS_STEP", "MIN_BRIGHTNESS", "REMEMBER_BRIGHTNESS",
 )
+CONFIG_LOADED = None                              # path actually read, for --check
 
 
-def load_config(path=CONFIG_FILE):
-    """Apply /etc/trackpad-edges/config.toml on top of the defaults above."""
+def _convert(name, raw):
+    """Config text -> the type of the default it replaces. Raises ValueError."""
+    default = globals()[name]
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        raw = raw[1:-1]                           # `touchpad_name = "ELAN"` is fine too
+    if type(default) is bool:
+        low = raw.lower()
+        if low in ("1", "yes", "true", "on"):
+            return True
+        if low in ("0", "no", "false", "off"):
+            return False
+        raise ValueError(f"expected true/false, got {raw!r}")
+    return type(default)(raw)
+
+
+def parse_config(text, source="config"):
+    """INI text -> ({SETTING: value}, {monitor: nits}). Bad lines are logged and skipped.
+
+    Settings live in [settings] (or before any section); peak brightness in [nits].
+    """
+    cp = configparser.ConfigParser(default_section="__none__", interpolation=None,
+                                   inline_comment_prefixes=("#", ";"))
+    cp.optionxform = str                          # keep monitor names as written
+    cp.read_string("[settings]\n" + text, source=source)
+    settings, nits = {}, {}
+    for key, raw in cp["settings"].items():
+        name = key.upper()
+        if name not in _CONFIGURABLE:
+            log(f"{source}: unknown setting {key!r}")
+            continue
+        try:
+            settings[name] = _convert(name, raw)
+        except ValueError as e:
+            log(f"{source}: bad value for {key!r}: {e}")
+    if cp.has_section("nits"):
+        for key, raw in cp["nits"].items():
+            name = key.strip().strip("\"'")
+            try:
+                nits[name] = float(raw.strip().strip("\"'"))
+            except ValueError:
+                log(f"{source}: bad nits for {key!r}: {raw!r}")
+    for section in cp.sections():
+        if section not in ("settings", "nits"):
+            log(f"{source}: unknown section [{section}]")
+    return settings, nits
+
+
+def parse_old_config(path=OLD_CONFIG_FILE):
+    """The pre-1.1 TOML config -> same shape as parse_config(), or None."""
     try:
         import tomllib                            # Python 3.11+
     except ImportError:
         try:
-            import tomli as tomllib               # older Pythons: pip/apt python3-tomli
+            import tomli as tomllib
         except ImportError:
-            log(f"Python < 3.11 without tomli: ignoring {path}, using defaults")
-            return
+            return None
     try:
         with open(path, "rb") as f:
             cfg = tomllib.load(f)
-    except FileNotFoundError:
-        return
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        log(f"ignoring {path}: {e}")
-        return
-    g = globals()
+    except (OSError, ValueError):
+        return None
+    settings, nits = {}, {}
     for key, value in cfg.items():
         name = key.upper()
         if name == "SCREEN_NITS" and isinstance(value, dict):
-            g["SCREEN_NITS"] = {"internal": SCREEN_NITS["internal"], **value}
-        elif name in _CONFIGURABLE and (type(value) is type(g[name]) or
-                                        (type(g[name]) is float and type(value) is int)):
-            g[name] = type(g[name])(value)        # `edge_width = 1` is fine for a float
-        else:
-            log(f"{path}: unknown or wrongly typed setting {key!r}")
+            nits = {k: float(v) for k, v in value.items() if isinstance(v, (int, float))}
+        elif name in _CONFIGURABLE:
+            try:
+                settings[name] = _convert(name, str(value))
+            except ValueError:
+                pass
+    return settings, nits
+
+
+def apply_config(settings, nits):
+    g = globals()
+    g.update(settings)
+    if nits:                                      # a [nits] section replaces the list
+        g["SCREEN_NITS"] = {"internal": SCREEN_NITS["internal"], **nits}
+
+
+def load_config(path=None):
+    """Apply /etc/trackpad-edges.conf (or the old TOML file) on top of the defaults."""
+    global CONFIG_LOADED
+    path = path or CONFIG_FILE
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        old = parse_old_config() if path == CONFIG_FILE else None
+        if old:
+            apply_config(*old)
+            CONFIG_LOADED = OLD_CONFIG_FILE
+            log(f"loaded {OLD_CONFIG_FILE} (old format; rerun install.sh to migrate it)")
+        return
+    except OSError as e:
+        log(f"ignoring {path}: {e}")
+        return
+    try:
+        apply_config(*parse_config(text, path))
+    except configparser.Error as e:
+        log(f"ignoring {path}: {e}")
+        return
+    CONFIG_LOADED = path
     log(f"loaded {path}")
+
+
+SEED_NITS = {"internal": 400, "ARZOPA": 300, "G241VC": 250}
+
+
+def render_config(template, settings, nits):
+    """The example config with `settings` filled in and its [nits] list replaced."""
+    head, sep, tail = template.partition("\n[nits]\n")
+    out = []
+    for line in head.splitlines():
+        m = re.match(r"([a-z_]+)\s*=\s*(.*?)(\s+#.*)?$", line)
+        if m and m.group(1).upper() in settings:
+            value = settings[m.group(1).upper()]
+            value = str(value).lower() if type(value) is bool else value
+            line = f"{m.group(1)} = {value}".ljust(len(line) - len(m.group(3) or "")) \
+                + (m.group(3) or "")
+        out.append(line.rstrip())
+    if sep:
+        out.append("\n[nits]")
+        out += [l for l in tail.splitlines() if l.startswith("#")]
+        out += [f"{k} = {int(v) if float(v).is_integer() else v}" for k, v in nits.items()]
+    return "\n".join(out) + "\n"
+
+
+def migrate_config(template_path, out_path, extra_nits=None):
+    """Write out_path from the example, carrying over the old config's values.
+
+    Nits come from the old TOML config and `extra_nits` (e.g. an older script's
+    built-in list); the seeds fill in only monitors none of those mention, so
+    "Optix G241VC" = 260 replaces the G241VC seed instead of sitting beside it.
+    """
+    settings, nits = parse_old_config() or ({}, {})
+    nits = {**(extra_nits or {}), **nits}
+    for key, value in SEED_NITS.items():
+        if not any(key.lower() in k.lower() for k in nits):
+            nits[key] = value
+    nits = {"internal": nits.pop("internal"), **nits}
+    text = render_config(Path(template_path).read_text(), settings, nits)
+    parse_config(text, out_path)                  # never write something we can't read
+    Path(out_path).write_text(text)
+    os.chmod(out_path, 0o644)
+    return settings, nits
 
 
 class EdgeSwipe:
@@ -155,13 +282,15 @@ class EdgeSwipe:
         ecodes.BTN_TOOL_QUINTTAP,
     )
 
-    def __init__(self, max_x, max_y, on_step):
-        self.left_max = max_x * EDGE_WIDTH
-        self.right_min = max_x * (1 - EDGE_WIDTH)
-        self.slack = self.left_max * 0.3          # sideways drift allowed
-        self.top_limit = max_y * TOP_DEAD_ZONE
-        self.activation = max_y * ACTIVATION
-        self.sensitivity = max_y * SENSITIVITY
+    def __init__(self, x_range, y_range, on_step):
+        (x0, x1), (y0, y1) = x_range, y_range     # some pads don't start at 0
+        w, h = x1 - x0, y1 - y0
+        self.left_max = x0 + w * EDGE_WIDTH
+        self.right_min = x0 + w * (1 - EDGE_WIDTH)
+        self.slack = w * EDGE_WIDTH * 0.3         # sideways drift allowed
+        self.top_limit = y0 + h * TOP_DEAD_ZONE
+        self.activation = h * ACTIVATION
+        self.sensitivity = h * SENSITIVITY
         self.on_step = on_step
         self.reset()
 
@@ -267,22 +396,159 @@ def _spawn(cmd):
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
 
 
+def _run(cmd, timeout=5):
+    """Run cmd and return its stdout, or None if it failed."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+# ---- who is sitting at the screen ----
+
+class Session(tuple):
+    """The logged-in user in front of seat0. Indexes like (uid, name)."""
+
+    def __new__(cls, uid, name, sid="", kind="", desktop=""):
+        self = super().__new__(cls, (uid, name))
+        self.uid, self.name, self.sid, self.kind = uid, name, sid, kind
+        self.desktop = desktop                    # logind's raw Desktop= value
+        return self
+
+
+# logind rewrites these (by rename) whenever sessions come, go or switch, so
+# their stat changing is a cheap "ask loginctl again" signal. Their contents
+# are private to systemd, so we never parse them.
+_LOGIND_STATE = ("/run/systemd/seats/seat0", "/run/systemd/sessions")
+_session_cache = {"stamp": None, "at": 0.0, "session": None}
+
+
+def _logind_stamp():
+    stamp = []
+    for f in _LOGIND_STATE:
+        try:
+            st = os.stat(f)
+            stamp.append((st.st_ino, st.st_mtime_ns))
+        except OSError:
+            stamp.append(None)
+    return tuple(stamp)
+
+
+def parse_props(text):
+    """`loginctl show-* -p A -p B` output -> {"A": ..., "B": ...}."""
+    return dict(line.split("=", 1) for line in (text or "").splitlines() if "=" in line)
+
+
+def _query_session():
+    if not shutil.which("loginctl"):              # no logind: best effort
+        for sock in sorted(glob.glob("/run/user/*/bus")):
+            uid = int(sock.split("/")[3])
+            if uid >= 1000:
+                try:
+                    return Session(uid, pwd.getpwuid(uid).pw_name)
+                except KeyError:
+                    pass
+        return None
+    sid = parse_props(_run(["loginctl", "show-seat", "seat0", "-p", "ActiveSession"])
+                      ).get("ActiveSession")
+    if not sid:
+        return None
+    p = parse_props(_run(["loginctl", "show-session", sid, "-p", "User", "-p", "Name",
+                          "-p", "Class", "-p", "Type", "-p", "Desktop", "-p", "State"]))
+    if p.get("Class") != "user" or p.get("State") not in ("active", "online"):
+        return None                               # the login screen (greeter) or nobody
+    try:
+        uid = int(p["User"])
+        name = p.get("Name") or pwd.getpwuid(uid).pw_name
+    except (KeyError, ValueError):
+        return None
+    return Session(uid, name, sid, p.get("Type", ""), p.get("Desktop", ""))
+
+
 def logged_in_user():
-    """(uid, name) of a real user with a running session bus, else None."""
-    for sock in glob.glob("/run/user/*/bus"):
-        uid = int(sock.split("/")[3])
-        if uid >= 1000:
+    """The active session on seat0 (multi-user and lingering-user safe), else None."""
+    stamp, now = _logind_stamp(), time.time()
+    c = _session_cache
+    if stamp != c["stamp"] or now - c["at"] > 60 or None in stamp:
+        c["session"], c["stamp"], c["at"] = _query_session(), stamp, now
+    return c["session"]
+
+
+_proc_cache = {}                                  # {uid: (checked at, {comm, ...})}
+
+
+def user_processes(uid, max_age=30):
+    """Names of the processes `uid` runs (cached; one /proc walk, no subprocess)."""
+    at, names = _proc_cache.get(uid, (0.0, set()))
+    if time.time() - at > max_age:
+        names = set()
+        for d in glob.glob("/proc/[0-9]*"):
             try:
-                return uid, pwd.getpwuid(uid).pw_name
-            except KeyError:
-                pass
-    return None
+                if os.stat(d).st_uid == uid:
+                    names.add(Path(d, "comm").read_text().strip())
+            except OSError:
+                continue
+        _proc_cache[uid] = (time.time(), names)
+    return names
+
+
+# process name -> desktop; checked first because logind's Desktop= is the
+# session name ("ubuntu", "plasma", "gnome-xorg"...), not always the desktop
+_DESKTOP_PROCS = (
+    ("plasmashell", "kde"), ("gnome-shell", "gnome"), ("cinnamon", "cinnamon"),
+    ("xfce4-session", "xfce"), ("niri", "niri"), ("Hyprland", "hyprland"),
+    ("sway", "sway"),
+)
+
+
+def desktop_from_name(name):
+    n = (name or "").lower()
+    for key, desk in (("kde", "kde"), ("plasma", "kde"), ("gnome", "gnome"),
+                      ("ubuntu", "gnome"), ("pop", "gnome"), ("cinnamon", "cinnamon"),
+                      ("xfce", "xfce"), ("niri", "niri"), ("hyprland", "hyprland"),
+                      ("sway", "sway")):
+        if key in n:
+            return desk
+    return n or "unknown"
+
+
+def desktop_of(session):
+    """'kde', 'gnome', 'niri', ... for a Session; None at the login screen."""
+    if not session:
+        return None
+    procs = user_processes(session.uid)
+    for proc, desk in _DESKTOP_PROCS:
+        if proc in procs:
+            return desk
+    return desktop_from_name(session.desktop)
+
+
+def plasma_running(uid):
+    return "plasmashell" in user_processes(uid)
+
+
+def session_bus(uid):
+    """The user's D-Bus address: systemd's per-user bus, else whatever their apps use."""
+    if os.path.exists(f"/run/user/{uid}/bus"):
+        return f"unix:path=/run/user/{uid}/bus"
+    for d in glob.glob("/proc/[0-9]*"):          # rare: dbus-launch on X11
+        try:
+            if os.stat(d).st_uid != uid:
+                continue
+            env = Path(d, "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        for var in env:
+            if var.startswith(b"DBUS_SESSION_BUS_ADDRESS="):
+                return var.split(b"=", 1)[1].decode()
+    return f"unix:path=/run/user/{uid}/bus"
 
 
 def as_user(user, *cmd):
-    uid, name = user
+    uid, name = user[0], user[1]
     return ["runuser", "-u", name, "--", "env",
-            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+            f"DBUS_SESSION_BUS_ADDRESS={session_bus(uid)}",
             f"XDG_RUNTIME_DIR=/run/user/{uid}", *cmd]
 
 
@@ -293,48 +559,248 @@ def kde_shortcut(user, component, action):
         "org.kde.kglobalaccel.Component.invokeShortcut", f"string:{action}"))
 
 
-_plasma_cache = {}                                # {uid: (checked at, running?)}
+# ---- media keys (GNOME) ----
+# GNOME Shell only lets its own daemons call ShowOSD, so on GNOME we press the
+# volume/brightness keys on a virtual keyboard instead: GNOME then changes the
+# level itself, keeps its sliders right and shows its own OSD.
+
+_keys = {"dev": None, "failed": False}
 
 
-def plasma_running(uid):
-    at, running = _plasma_cache.get(uid, (0.0, False))
-    if time.time() - at > 30:
-        running = subprocess.run(["pgrep", "-u", str(uid), "-x", "plasmashell"],
-                                 stdout=subprocess.DEVNULL).returncode == 0
-        _plasma_cache[uid] = (time.time(), running)
-    return running
+def keys_possible():
+    return os.path.exists("/dev/uinput") and not _keys["failed"]
+
+
+def press_key(code, times=1):
+    """Tap a key on our virtual keyboard. False if uinput is unavailable."""
+    if _keys["dev"] is None:
+        if _keys["failed"]:
+            return False
+        try:
+            from evdev import UInput
+            _keys["dev"] = UInput({ecodes.EV_KEY: [
+                ecodes.KEY_VOLUMEUP, ecodes.KEY_VOLUMEDOWN,
+                ecodes.KEY_BRIGHTNESSUP, ecodes.KEY_BRIGHTNESSDOWN]},
+                name="trackpad-edges keys")
+            time.sleep(0.3)                       # let the compositor pick it up
+        except Exception as e:
+            log(f"virtual keyboard unavailable ({e}); falling back")
+            _keys["failed"] = True
+            return False
+    dev = _keys["dev"]
+    for _ in range(times):
+        dev.write(ecodes.EV_KEY, code, 1)
+        dev.syn()
+        dev.write(ecodes.EV_KEY, code, 0)
+        dev.syn()
+    return True
+
+
+# ---- popups ----
+
+_notify = {"replace": None, "ids": {}}
+
+
+def notify_command(kind, percent, muted=False, replace_id=None, can_replace=True):
+    """notify-send arguments for a volume/brightness popup with a progress bar.
+
+    The hints make dunst, mako, swaync and GNOME/Cinnamon/XFCE replace the
+    previous popup instead of stacking a new one per step.
+    """
+    if kind == "volume":
+        level = "muted" if muted or percent == 0 else \
+            "low" if percent < 34 else "medium" if percent < 67 else "high"
+        icon, title = f"audio-volume-{level}", "Volume"
+    else:
+        icon, title = "display-brightness", "Brightness"
+    tag = f"trackpad-edges-{kind}"
+    cmd = ["notify-send", "-a", "trackpad-edges", "-u", "low", "-t", "1500", "-i", icon,
+           "-h", f"int:value:{percent}",
+           "-h", f"string:x-canonical-private-synchronous:{tag}",
+           "-h", f"string:x-dunst-stack-tag:{tag}",
+           "-h", "boolean:transient:true"]
+    if can_replace:
+        cmd.append("-p")                          # print the id so the next one replaces it
+        if replace_id:
+            cmd += ["-r", str(replace_id)]
+    return cmd + [title, f"{percent}%" + (" (muted)" if muted else "")]
+
+
+def notify(user, kind, percent, muted=False):
+    if not shutil.which("notify-send"):
+        return
+    if _notify["replace"] is None:                # -p/-r need libnotify 0.7.10+
+        _notify["replace"] = "--replace-id" in (_run(["notify-send", "--help"]) or "")
+    key = (user[0], kind)
+    out = _run(as_user(user, *notify_command(kind, percent, muted, _notify["ids"].get(key),
+                                             _notify["replace"])), timeout=3)
+    if out and out.strip().isdigit():
+        _notify["ids"][key] = int(out.strip())
+
+
+# ---- volume ----
+
+def volume_method(user):
+    """How a volume step is done for this session: kde, keys, wpctl, pactl or None."""
+    if not user:
+        return None                               # no audio session at the login screen
+    if VOLUME_BACKEND != "auto":
+        return VOLUME_BACKEND
+    desk = desktop_of(user)
+    if desk == "kde":
+        return "kde"
+    if desk == "gnome" and keys_possible():
+        return "keys"
+    if shutil.which("wpctl"):
+        return "wpctl"
+    if shutil.which("pactl"):
+        return "pactl"
+    return None
+
+
+def volume_popup(method):
+    return {"kde": "Plasma OSD", "keys": "GNOME OSD"}.get(method) or \
+        ("notify-send" if POPUP != "none" and method else "none")
+
+
+def parse_wpctl_volume(text):
+    """`wpctl get-volume` -> (percent, muted) or None. e.g. 'Volume: 0.45 [MUTED]'."""
+    m = re.search(r"Volume:\s*([\d.]+)", text or "")
+    return (round(float(m.group(1)) * 100), "MUTED" in text) if m else None
+
+
+def parse_pactl_volume(volume_text, mute_text=""):
+    """`pactl get-sink-volume` (+ get-sink-mute) -> (percent, muted) or None."""
+    pcts = [int(p) for p in re.findall(r"(\d+)%", volume_text or "")]
+    if not pcts:
+        return None
+    return round(sum(pcts) / len(pcts)), "yes" in (mute_text or "").lower()
+
+
+def volume_commands(method, n, current=None):
+    """Commands (to run as the user) that move the volume n steps.
+
+    Raising always unmutes; the result never goes past 100%. pactl has no
+    limit flag, so it needs the `current` percentage to cap against.
+    """
+    up = n > 0
+    if method == "wpctl":
+        sink = "@DEFAULT_AUDIO_SINK@"
+        cmds = [["wpctl", "set-mute", sink, "0"]] if up else []
+        return cmds + [["wpctl", "set-volume", "-l", "1.0", sink,
+                        f"{abs(n) * VOLUME_STEP}%{'+' if up else '-'}"]]
+    if method == "pactl":
+        sink = "@DEFAULT_SINK@"
+        cmds = [["pactl", "set-sink-mute", sink, "0"]] if up else []
+        if current is None:
+            return cmds + [["pactl", "set-sink-volume", sink,
+                            f"{'+' if up else '-'}{abs(n) * VOLUME_STEP}%"]]
+        target = max(0, min(100, current + n * VOLUME_STEP))
+        return cmds + [["pactl", "set-sink-volume", sink, f"{target}%"]]
+    return []
+
+
+def read_volume(user, method):
+    if method == "wpctl":
+        return parse_wpctl_volume(_run(as_user(user, "wpctl", "get-volume",
+                                               "@DEFAULT_AUDIO_SINK@")))
+    if method == "pactl":
+        return parse_pactl_volume(
+            _run(as_user(user, "pactl", "get-sink-volume", "@DEFAULT_SINK@")),
+            _run(as_user(user, "pactl", "get-sink-mute", "@DEFAULT_SINK@")))
+    return None
+
+
+class Volume:
+    """Applies volume steps off the touchpad thread, merging quick ones into one change."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.pending = 0
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def step(self, direction):
+        with self.lock:
+            self.pending += direction
+        self.wake.set()
+
+    def _worker(self):
+        while True:
+            self.wake.wait()                      # sleeps until a swipe
+            self.wake.clear()
+            with self.lock:
+                n, self.pending = self.pending, 0
+            if n:
+                try:
+                    self.apply(n)
+                except Exception as e:
+                    log(f"volume error: {e!r}")
+
+    def apply(self, n):
+        user = logged_in_user()
+        method = volume_method(user)
+        if method == "kde":
+            for _ in range(abs(n)):
+                kde_shortcut(user, "kmix", "increase_volume" if n > 0 else "decrease_volume")
+            return
+        if method == "keys" and press_key(
+                ecodes.KEY_VOLUMEUP if n > 0 else ecodes.KEY_VOLUMEDOWN, abs(n)):
+            return
+        if method == "keys":                      # uinput failed: pick again without it
+            method = volume_method(user)
+        if method not in ("wpctl", "pactl"):
+            return
+        current = read_volume(user, method) if method == "pactl" else None
+        for cmd in volume_commands(method, n, current and current[0]):
+            _run(as_user(user, *cmd))
+        if POPUP != "none":
+            now = read_volume(user, method)
+            if now:
+                notify(user, "volume", *now)
+
+
+_volume = None
 
 
 def change_volume(direction):
-    user = logged_in_user()
-    if not user:
-        return                                    # no audio session at the login screen
-    backend = VOLUME_BACKEND
-    if backend == "auto":
-        if plasma_running(user[0]):
-            backend = "kde"
-        elif shutil.which("wpctl"):
-            backend = "wpctl"
-        else:
-            backend = "pactl"
-    if backend == "kde":
-        kde_shortcut(user, "kmix", "increase_volume" if direction > 0 else "decrease_volume")
-    elif backend == "wpctl":
-        _spawn(as_user(user, "wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@",
-                       f"{VOLUME_STEP}%{'+' if direction > 0 else '-'}"))
-    else:
-        _spawn(as_user(user, "pactl", "set-sink-volume", "@DEFAULT_SINK@",
-                       f"{'+' if direction > 0 else '-'}{VOLUME_STEP}%"))
+    global _volume
+    if _volume is None:
+        _volume = Volume()
+    _volume.step(direction)
+
+
+# ---- brightness ----
+
+def brightness_method(user):
+    """'kde' (KWin owns the panel), 'keys' (GNOME owns it) or 'sysfs' (we write it)."""
+    desk = desktop_of(user)
+    if desk == "kde":
+        return "kde"
+    if desk == "gnome" and keys_possible():
+        return "keys"
+    return "sysfs"
+
+
+def brightness_popup(user):
+    if not user or POPUP == "none":
+        return "none"
+    return {"kde": "Plasma OSD", "keys": "GNOME OSD"}.get(brightness_method(user),
+                                                           "notify-send")
 
 
 def show_osd(percent):
-    """Best-effort KDE on-screen display (does nothing at the login screen)."""
+    """Brightness popup for the logged-in user (nothing at the login screen)."""
     user = logged_in_user()
-    if user and plasma_running(user[0]):
+    if not user or POPUP == "none":
+        return
+    if plasma_running(user[0]):
         _spawn(as_user(
             user, "dbus-send", "--type=method_call", "--dest=org.kde.plasmashell",
             "/org/kde/osdService", "org.kde.osdService.brightnessChanged",
             f"int32:{percent}"))
+    else:
+        notify(user, "brightness", percent)
 
 
 def kde_internal_display(user):
@@ -472,6 +938,21 @@ def edid_name(path):
         if d[0:3] == b"\x00\x00\x00" and d[3] == 0xFC:
             model = d[5:18].decode("ascii", "ignore").split("\n")[0].strip()
     return f"{mfg}:{model}"
+
+
+def parse_ddcutil_detect(text):
+    """`ddcutil detect --brief` -> [(i2c bus, monitor name)] of external monitors."""
+    found = []
+    for block in re.split(r"\n(?=Display \d|Invalid display)", "\n" + (text or "")):
+        block = block.strip()
+        if not block.startswith("Display "):      # skips "Invalid display" entries
+            continue
+        bus = re.search(r"/dev/i2c-(\d+)", block)
+        if not bus or re.search(r"eDP|LVDS|DSI", block):   # skip the built-in panel
+            continue
+        mon = re.search(r"Monitor:\s*(.+)", block)
+        found.append((bus.group(1), mon.group(1).strip() if mon else ""))
+    return found
 
 
 class PanelCurve:
@@ -831,22 +1312,13 @@ class Screens:
         return found
 
     def _scan_ddcutil(self):
-        found = []
         try:
             r = subprocess.run(["ddcutil", "detect", "--brief"], capture_output=True,
                                text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
             log(f"ddcutil detect could not run: {e}")
-            return found
-        for block in re.split(r"\n(?=Display \d|Invalid display)", "\n" + r.stdout):
-            block = block.strip()
-            if not block.startswith("Display "):  # skips "Invalid display" entries
-                continue
-            bus = re.search(r"/dev/i2c-(\d+)", block)
-            if not bus or "eDP" in block:         # skip the built-in panel
-                continue
-            mon = re.search(r"Monitor:\s*(.+)", block)
-            found.append((bus.group(1), self._peak_for(mon.group(1) if mon else "")))
+            return []
+        found = [(bus, self._peak_for(name)) for bus, name in parse_ddcutil_detect(r.stdout)]
         if not found:
             log(f"ddcutil detect saw no monitors. stdout={r.stdout[:300]!r} stderr={r.stderr[:300]!r}")
         return found
@@ -878,6 +1350,16 @@ class Screens:
         if bl is None:
             return
         self._maybe_rescan()
+        if brightness_method(logged_in_user()) == "keys" and press_key(
+                ecodes.KEY_BRIGHTNESSUP if n > 0 else ecodes.KEY_BRIGHTNESSDOWN, abs(n)):
+            # GNOME moves the panel (and its slider and OSD); monitors follow it
+            time.sleep(0.4)
+            t = self._panel_nits(bl)
+            if t is not None:
+                self.known, self.driven_at = t, time.time()
+                self._push_all(t)
+                self._remember(t)
+            return
         if self.known is not None and time.time() - self.driven_at < SETTLE_TIME:
             t = self.known                  # mid-swipe: the panel may still be fading
         else:
@@ -902,6 +1384,10 @@ class Screens:
         self._maybe_rescan()
         t_min, t_max, _ = self._range(bl)
         t = min(t_max, max(t_min, self.saved))    # keeps self.saved for a bigger monitor
+        if brightness_method(logged_in_user()) == "keys":
+            t = self._panel_nits(bl)              # GNOME restores its own level: match it
+            if t is None:
+                return
         log(f"restoring brightness: {t:.0f} nits")
         self.synced.clear()                       # a resumed monitor may have reset
         self._drive(bl, t)
@@ -911,8 +1397,12 @@ class Screens:
         want = max(1, round(curve.requested(t, SCREEN_NITS["internal"])))
         # On Plasma, KWin owns the backlight: hand it the level so the tray
         # slider and KWin's saved brightness follow. Writing sysfs as well
-        # would fight KWin's fade. Elsewhere (or at the login screen) write it.
-        if not sync_kde(want / curve.max):
+        # would fight KWin's fade. GNOME owns it too (we only follow it there).
+        # Elsewhere, and at the login screen, write it ourselves.
+        method = brightness_method(logged_in_user())
+        if method == "keys":
+            pass
+        elif not (method == "kde" and sync_kde(want / curve.max)):
             try:
                 cur = int(Path(bl, "brightness").read_text())
                 if want != cur:                # skip a pointless sysfs write
@@ -1067,38 +1557,63 @@ def recalibrate():
 
 # ---------------- device handling ----------------
 
+def is_touchpad(caps, props):
+    """Multitouch X/Y plus finger tool, and not a touchscreen (INPUT_PROP_DIRECT)."""
+    axes = {code for code, _ in caps.get(ecodes.EV_ABS, [])}
+    return (ecodes.ABS_MT_POSITION_X in axes and ecodes.ABS_MT_POSITION_Y in axes
+            and ecodes.BTN_TOOL_FINGER in caps.get(ecodes.EV_KEY, [])
+            and ecodes.INPUT_PROP_DIRECT not in props)
+
+
+def touchpad_rank(name):
+    """Lower is better: the configured name, then anything called a touchpad."""
+    if TOUCHPAD_NAME and re.search(TOUCHPAD_NAME, name, re.IGNORECASE):
+        return 0
+    return 1 if "touchpad" in name.lower() else 2
+
+
 def find_touchpad():
-    fallback = None
+    """(device, {abs code: AbsInfo}) of the best touchpad, or None."""
+    best = None
     for path in list_devices():
         try:
             dev = InputDevice(path)
-            axes = dict(dev.capabilities().get(ecodes.EV_ABS, []))
+            caps = dev.capabilities()
+            ok = is_touchpad(caps, dev.input_props())
         except OSError:
             continue
-        if ecodes.ABS_MT_POSITION_X not in axes or ecodes.ABS_MT_POSITION_Y not in axes:
-            dev.close()
-            continue
-        if TOUCHPAD_NAME and re.search(TOUCHPAD_NAME, dev.name, re.IGNORECASE):
-            return dev, axes
-        if "touchpad" in dev.name.lower() and fallback is None:
-            fallback = (dev, axes)
+        rank = touchpad_rank(dev.name)
+        if ok and (best is None or rank < best[0]):
+            if best:
+                best[1].close()
+            best = (rank, dev, dict(caps[ecodes.EV_ABS]))
         else:
             dev.close()
-    return fallback
+    return best[1:] if best else None
+
+
+def axis_range(info):
+    return info.min, info.max
 
 
 def main():
     global screens
     load_config()
     screens = Screens()
+    waited = 0
     while True:
         found = find_touchpad()
-        if not found:                             # not up yet: just keep looking
-            time.sleep(1)
+        if not found:                             # not up yet: keep looking, slower over time
+            if waited in (0, 30):
+                log("no touchpad found yet; `sudo trackpad_edges.py --check` explains why")
+            time.sleep(1 if waited < 30 else 5)
+            waited += 1
             continue
+        waited = 0
         dev, axes = found
-        detector = EdgeSwipe(axes[ecodes.ABS_MT_POSITION_X].max,
-                             axes[ecodes.ABS_MT_POSITION_Y].max, on_step)
+        log(f"using touchpad {dev.name!r} ({dev.path})")
+        detector = EdgeSwipe(axis_range(axes[ecodes.ABS_MT_POSITION_X]),
+                             axis_range(axes[ecodes.ABS_MT_POSITION_Y]), on_step)
         try:
             for ev in dev.read_loop():
                 detector.feed(ev)
@@ -1109,15 +1624,122 @@ def main():
         time.sleep(1)
 
 
+def check():
+    """Print what was detected and how each edge will act. Changes nothing."""
+    def row(label, value):
+        print(f"{label:<14}{value}")
+
+    row("config", CONFIG_LOADED or f"none (defaults; expected {CONFIG_FILE})")
+    found = find_touchpad()
+    if found:
+        dev, axes = found
+        x, y = axes[ecodes.ABS_MT_POSITION_X], axes[ecodes.ABS_MT_POSITION_Y]
+        row("touchpad", f"{dev.name} ({dev.path})  x {x.min}..{x.max}  y {y.min}..{y.max}")
+        dev.close()
+    else:
+        row("touchpad", "NOT FOUND (no device with multitouch X/Y and a finger tool)")
+        for path in list_devices():
+            try:
+                d = InputDevice(path)
+                row("", f"seen: {d.name} ({path})")
+                d.close()
+            except OSError:
+                pass
+
+    bl = backlight()
+    if bl:
+        max_b = int(Path(bl, "max_brightness").read_text())
+        curve = PanelCurve(max_b)
+        cal = "calibrated" if curve.load() else "not calibrated yet (one flash on first swipe)"
+        row("backlight", f"{bl}  max {max_b}  curve {cal}")
+    else:
+        row("backlight", "none (no laptop panel found; external monitors only)")
+
+    mons = Screens(start=False)
+    mons._scan()
+    if mons.externals:
+        for bus, peak in mons.externals:
+            row("monitor", f"i2c-{bus}  peak {f'{peak:g} nits' if peak else 'unlisted (as bright as the panel)'}")
+    else:
+        row("monitor", "no DDC/CI monitor found" + ("" if shutil.which("ddcutil") else " (ddcutil not installed)"))
+    if not glob.glob("/dev/i2c-*"):
+        row("", "no /dev/i2c-* (load i2c-dev: sudo modprobe i2c-dev)")
+
+    user = logged_in_user()
+    if user:
+        row("session", f"{user.name} (uid {user.uid}, session {user.sid}, {user.kind or '?'})")
+        row("desktop", f"{desktop_of(user)} (logind says {user.desktop or 'nothing'!r})")
+    else:
+        row("session", "none (login screen): brightness works, volume waits for a login")
+    vm = volume_method(user)
+    row("volume", f"{vm or 'none'}  popup: {volume_popup(vm)}" if user else "after login")
+    row("brightness", f"{brightness_method(user)} + ddcutil  popup: {brightness_popup(user)}")
+    for edge, action in (("left edge", LEFT_EDGE), ("right edge", RIGHT_EDGE)):
+        row(edge, action)
+    if user and "notify-send" in (volume_popup(vm), brightness_popup(user)):
+        if not shutil.which("notify-send"):
+            row("", "notify-send missing: install libnotify (libnotify-bin on Debian/Ubuntu)")
+        elif not notification_daemon(user):
+            row("", "no notification daemon (e.g. mako, dunst, swaync): no popups")
+    return 0 if found else 1
+
+
+def notification_daemon(user):
+    """True if something answers (or would be started for) org.freedesktop.Notifications."""
+    def bus(method, *args):
+        return _run(as_user(user, "dbus-send", "--session", "--print-reply",
+                            "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+                            f"org.freedesktop.DBus.{method}", *args)) or ""
+    name = "org.freedesktop.Notifications"
+    return "true" in bus("NameHasOwner", f"string:{name}") or \
+        f'"{name}"' in bus("ListActivatableNames")
+
+
+def script_nits(path):
+    """SCREEN_NITS from an older installed copy of this script, or {}."""
+    import ast
+    try:
+        tree = ast.parse(Path(path).read_text())
+    except (OSError, SyntaxError, ValueError):
+        return {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == "SCREEN_NITS" for t in node.targets):
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                return {}
+            return {k: float(v) for k, v in value.items() if isinstance(v, (int, float))}
+    return {}
+
+
+USAGE = """usage: trackpad_edges.py [--check | --status | --calibrate]
+  --check      show the touchpad, screens, session and methods it will use
+  --status     show each screen's brightness in nits
+  --calibrate  re-measure the laptop panel's brightness curve"""
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "--migrate-config":                # used by install.sh
+        # --migrate-config TEMPLATE OUT [OLD_SCRIPT]
+        extra = script_nits(sys.argv[4]) if len(sys.argv) > 4 else {}
+        settings, nits = migrate_config(sys.argv[2], sys.argv[3], extra)
+        print(f"   carried over: {', '.join(k.lower() for k in settings) or 'no settings'}; "
+              f"nits: {', '.join(f'{k}={v:g}' for k, v in nits.items())}")
+        sys.exit(0)
     if mode:
         load_config()
+    if mode in ("--check", "-c"):
+        sys.exit(check())
     if mode in ("--status", "-s"):
         sys.exit(status())
     if mode == "--calibrate":
         sys.exit(recalibrate())
+    if mode in ("--help", "-h"):
+        print(USAGE)
+        sys.exit(0)
     if mode:
-        print(f"unknown option {mode!r}; try --status or --calibrate")
+        print(f"unknown option {mode!r}\n{USAGE}")
         sys.exit(2)
     main()

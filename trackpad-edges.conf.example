@@ -1,0 +1,39 @@
+# trackpad-edges settings: /etc/trackpad-edges.conf
+# The installer creates this file once and never overwrites it. After editing:
+#   sudo systemctl restart trackpad-edges
+# Anything left out uses the default shown here.
+
+# Regex for your touchpad's name (see `sudo trackpad_edges.py --check`).
+# Empty = found automatically by its capabilities.
+touchpad_name =
+
+# What each edge does: volume, brightness or none.
+left_edge = volume
+right_edge = brightness
+
+# Touch zones, as fractions of the touchpad size.
+edge_width = 0.07       # width of the left/right strips
+top_dead_zone = 0.20    # touches starting in the top 20% are ignored (NumberPad; 0 = off)
+activation = 0.03       # vertical travel before the first step
+sensitivity = 0.018     # vertical travel per step (smaller = faster)
+
+# Volume: auto = KDE's shortcut on Plasma, the volume keys on GNOME,
+# otherwise wpctl (PipeWire), otherwise pactl (PulseAudio).
+volume_backend = auto   # auto, kde, keys, wpctl or pactl
+volume_step = 5         # percent per step (wpctl / pactl only)
+
+# Popups: auto = the desktop's own OSD on KDE and GNOME, notify-send elsewhere.
+popup = auto            # auto or none
+
+# Brightness
+brightness_step = 0.05  # each step = 5% on the brightness slider
+min_brightness = 0.01   # dimmest allowed = 1% on the slider
+remember_brightness = true   # restore the last level after reboot/login/resume
+
+[nits]
+# Peak brightness in nits, so the laptop and external monitors look equally
+# bright. internal = the laptop panel (its SDR rating, not HDR). Other names
+# match part of the monitor name from `sudo ddcutil detect --brief`.
+internal = 400
+ARZOPA = 300
+G241VC = 250

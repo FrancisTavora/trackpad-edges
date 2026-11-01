@@ -33,7 +33,9 @@ remember_brightness = true   # restore the last level after reboot/login/resume
 [nits]
 # Peak brightness in nits, so the laptop and external monitors look equally
 # bright. internal = the laptop panel (its SDR rating, not HDR). Other names
-# match part of the monitor name from `sudo ddcutil detect --brief`.
+# match part of the monitor name shown by `sudo trackpad_edges.py --check`.
+# HDR monitors report their own peak; for the rest, run
+#   sudo trackpad_edges.py --match-monitors
+# to match them by eye and have their lines added here, e.g.
+#   U2720Q = 350
 internal = 400
-ARZOPA = 300
-G241VC = 250

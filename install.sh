@@ -68,7 +68,12 @@ fi
 if [ "$deps" -eq 1 ]; then
     echo "==> Installing dependencies (python evdev, ddcutil, notify-send)"
     if command -v pacman >/dev/null 2>&1; then
-        pacman -S --needed --noconfirm python python-evdev ddcutil libnotify
+        # no -Sy here: a partial upgrade can break an Arch system
+        if ! pacman -S --needed --noconfirm python python-evdev ddcutil libnotify; then
+            echo "pacman could not install the packages. Update your system first:" >&2
+            echo "  sudo pacman -Syu && sudo sh install.sh" >&2
+            exit 1
+        fi
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update
         apt-get install -y python3 python3-evdev ddcutil libnotify-bin
@@ -83,9 +88,14 @@ if [ "$deps" -eq 1 ]; then
     fi
 fi
 
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || {
+    echo "Python 3.8 or newer is needed; this system has $(python3 -V 2>&1)." >&2
+    exit 1
+}
 python3 -c "import evdev" || { echo "python evdev is not importable" >&2; exit 1; }
 
 echo "==> Loading i2c-dev (monitor brightness) and uinput (GNOME media keys)"
+mkdir -p "$(dirname "$MODULES")"
 printf 'i2c-dev\nuinput\n' > "$MODULES"
 modprobe i2c-dev || echo "   could not load i2c-dev; external monitors won't change"
 modprobe uinput || echo "   could not load uinput; GNOME falls back to wpctl and notify-send"

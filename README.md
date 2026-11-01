@@ -37,7 +37,8 @@ running `trackpad_edges.py --check`:
 | openSUSE | zypper | `python3 python3-evdev ddcutil libnotify-tools` |
 
 On another distro, install the equivalents yourself and run
-`sudo sh install.sh --no-deps`. You need systemd, Python 3 and a touchpad that
+`sudo sh install.sh --no-deps`. You need systemd, Python 3.8+ (so not
+openSUSE Leap 15, whose Python is 3.6) and a touchpad that
 reports multitouch positions (nearly all do).
 
 ### What each desktop gets
@@ -66,6 +67,13 @@ sudo sh install.sh --uninstall              # remove (or: sudo sh uninstall.sh)
 sudo sh install.sh --uninstall --purge      # also delete config and saved brightness
 ```
 
+**Updating from an older version** (the one with
+`/etc/trackpad-edges/config.toml`): just `git pull` and run
+`sudo sh install.sh` again. It stops the old service, moves your settings and
+monitor nits into the new `/etc/trackpad-edges.conf`, and leaves the old file
+in place, unused. To check which version is running, run
+`trackpad_edges.py --help`. The new version lists `--check`.
+
 ## Configure
 
 Edit `/etc/trackpad-edges.conf`, then run
@@ -84,11 +92,44 @@ popup = auto                      # or none
 
 [nits]                            # so monitors match the laptop
 internal = 400
-G241VC = 250
+U2720Q = 350
 ```
 
 Monitor names under `[nits]` match any part of the name that
-`sudo ddcutil detect --brief` prints.
+`sudo trackpad_edges.py --check` shows. You rarely need to type these lines
+yourself. See below.
+
+## External monitors
+
+You don't need to set anything up. Any monitor with DDC/CI follows the laptop's
+brightness.
+
+- **Plugging in**: the service hears about it from the kernel straight away,
+  with no polling. Within a second or two the monitor is set to the current
+  brightness. If its DDC/CI is still waking up, it tries again a few
+  seconds later.
+- **How bright the monitor really is**: to look *equally* bright, every
+  screen is driven to the same nits, so the service needs each monitor's
+  peak brightness.
+  1. If it's listed under `[nits]`, that number is used.
+  2. HDR monitors report their own peak in their EDID, and that's used
+     automatically.
+  3. Otherwise the monitor is treated as being as bright as the laptop panel.
+     The first time such a monitor is plugged in, you get one popup that
+     suggests the next step.
+- **Matching one by eye** takes about a minute per monitor:
+
+  ```sh
+  sudo trackpad_edges.py --match-monitors
+  ```
+
+  The laptop screen is set to a fixed level. For each monitor, use the arrow
+  keys until it looks as bright as the laptop. Looking at something white on
+  both helps. Use up/down for 1% steps and left/right for 5%. Enter saves,
+  `s` skips and `q` quits. The result goes into `[nits]` in
+  `/etc/trackpad-edges.conf`, and the rest of your file is left alone. The
+  service pauses while you do this. Afterwards your brightness is put back
+  and the service restarts.
 
 ## Troubleshooting
 
@@ -102,10 +143,10 @@ Example output:
 
 ```
 config        /etc/trackpad-edges.conf
-touchpad      ASUE140D:00 04F3:31BC Touchpad (/dev/input/event8)  x 0..3880  y 0..2299
-backlight     /sys/class/backlight/amdgpu_bl1  max 400000  curve calibrated
-monitor       no DDC/CI monitor found
-session       ferin (uid 1000, session 2, wayland)
+touchpad      ELAN1203:00 04F3:307A Touchpad (/dev/input/event8)  x 0..3200  y 0..2000
+backlight     /sys/class/backlight/amdgpu_bl1  max 255  curve calibrated
+monitor       DELL U2720Q (i2c-4)  peak 350 nits
+session       alice (uid 1000, session 2, wayland)
 desktop       kde (logind says 'KDE')
 volume        kde  popup: Plasma OSD
 brightness    kde + ddcutil  popup: Plasma OSD
@@ -113,6 +154,8 @@ left edge     volume
 right edge    brightness
 ```
 
+- **`--check` is an unknown option**: the old version is still installed. Run
+  `git pull`, then `sudo sh install.sh` again from the repo.
 - **`touchpad NOT FOUND`**: the list under it shows every input device.
   Set `touchpad_name` to a regex for yours.
 - **Swipes do nothing**: check `journalctl -u trackpad-edges -f` while you
@@ -123,6 +166,8 @@ right edge    brightness
   PulseAudio, make sure `pactl` is installed.
 - **No popup on niri/Hyprland/Sway**: install and start a notification daemon
   such as mako. `--check` says when none is running.
+- **A monitor looks brighter or dimmer than the laptop**: run
+  `sudo trackpad_edges.py --match-monitors`.
 - **External monitor doesn't change**: turn on DDC/CI in the monitor's own
   menu, and check `sudo ddcutil detect`. Some portable/USB-C monitors don't
   support DDC/CI at all. If `--check` says there is no `/dev/i2c-*`, run
@@ -134,19 +179,35 @@ right edge    brightness
 More tools:
 
 ```sh
-journalctl -u trackpad-edges -f        # live log
-sudo trackpad_edges.py --status        # brightness of every screen + saved level
-sudo trackpad_edges.py --calibrate     # re-measure the laptop panel's curve
+journalctl -u trackpad-edges -f          # live log (shows monitors as they're plugged in)
+sudo trackpad_edges.py --match-monitors  # match external monitors to the laptop by eye
+sudo trackpad_edges.py --status          # brightness of every screen + saved level
+sudo trackpad_edges.py --calibrate       # re-measure the laptop panel's curve
 ```
 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests     # unit + kernel tests
+sh tests/distros.sh                       # installer on each distro family (docker)
 ```
 
-The tests feed fake touch events, config files, `ddcutil` output and
-volume/session command output, so they run without a touchpad or root.
+- **Unit tests** feed fake touch events, config files, EDIDs, kernel hotplug
+  messages, `ddcutil` output and volume/session command output. One test
+  replays random swipes through the original detector and the current one,
+  to prove the swipe feel hasn't changed.
+- **Kernel tests** (`tests/test_e2e_uinput.py`) create a virtual touchpad and
+  a virtual touchscreen with uinput, then swipe through the real kernel. They
+  check that the touchpad is picked, that its axis ranges are used, and that
+  edge, corner and middle touches behave. They need access to `/dev/uinput`
+  and `/dev/input`, through root or the `uinput` and `input` groups, and are
+  skipped otherwise. The virtual pad is grabbed, so your desktop never sees
+  the swipes.
+- **`tests/distros.sh`** runs the real `install.sh` (package names, `/bin/sh`
+  being dash on Debian/Ubuntu) and the unit tests on Arch, Fedora,
+  Debian 12, Ubuntu 22.04/24.04 and openSUSE Tumbleweed/Leap 16 containers.
+  `systemctl` and `modprobe` are stubbed, because containers have no
+  systemd.
 
 ## Windows / macOS
 

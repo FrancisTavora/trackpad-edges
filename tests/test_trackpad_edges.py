@@ -174,9 +174,9 @@ class TouchpadPickTest(unittest.TestCase):
         self.assertFalse(te.is_touchpad(self.caps(mt=False), []))
 
     def test_rank_prefers_config_then_touchpad_name(self):
-        te.TOUCHPAD_NAME = "ASUE140D:00.*Touchpad"
-        self.assertEqual(te.touchpad_rank("ASUE140D:00 04F3:31B9 Touchpad"), 0)
-        self.assertEqual(te.touchpad_rank("ELAN0001:00 04F3:3140 Touchpad"), 1)
+        te.TOUCHPAD_NAME = "ELAN1203:00.*Touchpad"
+        self.assertEqual(te.touchpad_rank("ELAN1203:00 04F3:307A Touchpad"), 0)
+        self.assertEqual(te.touchpad_rank("SYNA2B5F:00 06CB:CE7E Touchpad"), 1)
         self.assertEqual(te.touchpad_rank("SYNA7DB5:01 06CB:CD41 Mouse"), 2)
 
 
@@ -196,16 +196,32 @@ class ConfigTest(unittest.TestCase):
         for name, value in settings.items():
             self.assertEqual(value, DEFAULTS[name], name)
             self.assertIs(type(value), type(DEFAULTS[name]), name)
-        self.assertEqual(nits, {"internal": 400, "ARZOPA": 300, "G241VC": 250})
+        self.assertEqual(nits, {"internal": 400})
 
     def test_types_comments_quotes(self):
         settings, nits = te.parse_config(
             'edge_width = 0.1   # wider\nvolume_step = 3\nremember_brightness = no\n'
-            'touchpad_name = "ELAN.*Touchpad"\n[nits]\ninternal = 500\n"Optix G241VC" = 260\n')
+            'touchpad_name = "ELAN.*Touchpad"\n[nits]\ninternal = 500\n"DELL U2720Q" = 260\n')
         self.assertEqual(settings, {"EDGE_WIDTH": 0.1, "VOLUME_STEP": 3,
                                     "REMEMBER_BRIGHTNESS": False,
                                     "TOUCHPAD_NAME": "ELAN.*Touchpad"})
-        self.assertEqual(nits, {"internal": 500.0, "Optix G241VC": 260.0})
+        self.assertEqual(nits, {"internal": 500.0, "DELL U2720Q": 260.0})
+
+    def test_monitor_names_may_contain_colons(self):
+        _, nits = te.parse_config("[nits]\nDEL:U2720Q = 350\n")
+        self.assertEqual(nits, {"DEL:U2720Q": 350.0})
+
+    def test_set_nits_line_adds_replaces_keeps_comments(self):
+        text = "sensitivity = 0.02  # mine\n\n[nits]\n# peaks\ninternal = 400\n"
+        added = te.set_nits_line(text, "U2720Q", 350)
+        self.assertEqual(added, "sensitivity = 0.02  # mine\n\n[nits]\n# peaks\n"
+                                "internal = 400\nU2720Q = 350\n")
+        replaced = te.set_nits_line(added, "u2720q", 330)
+        self.assertIn("u2720q = 330", replaced)
+        self.assertNotIn("350", replaced)
+        self.assertEqual(te.parse_config(replaced)[1], {"internal": 400, "u2720q": 330})
+        self.assertEqual(te.set_nits_line("popup = none\n", "X", 200),
+                         "popup = none\n\n[nits]\nX = 200\n")
 
     def test_bad_values_are_skipped(self):
         with mock.patch.object(te, "log") as log:
@@ -215,11 +231,11 @@ class ConfigTest(unittest.TestCase):
 
     def test_load_config_applies_and_nits_replace(self):
         path = self.tmp / "t.conf"
-        path.write_text("sensitivity = 0.02\n[nits]\nARZOPA = 280\n")
+        path.write_text("sensitivity = 0.02\n[nits]\nLG HDR 4K = 280\n")
         with mock.patch.object(te, "log"):
             te.load_config(str(path))
         self.assertEqual(te.SENSITIVITY, 0.02)
-        self.assertEqual(te.SCREEN_NITS, {"internal": 400, "ARZOPA": 280})
+        self.assertEqual(te.SCREEN_NITS, {"internal": 400, "LG HDR 4K": 280})
 
     def migrate(self, old_toml=None, old_nits=None):
         old = self.tmp / "config.toml"
@@ -234,37 +250,53 @@ class ConfigTest(unittest.TestCase):
 
     def test_migrate_fresh_install_seeds_nits(self):
         (settings, nits), _ = self.migrate()
-        self.assertEqual(nits, {"internal": 400, "ARZOPA": 300, "G241VC": 250})
+        self.assertEqual(nits, {"internal": 400})
+        self.assertEqual(settings["TOUCHPAD_NAME"], "")
 
     def test_migrate_carries_old_toml_values(self):
         (settings, nits), text = self.migrate(
-            'touchpad_name = "ASUE140D:00.*Touchpad"\nsensitivity = 0.02\n'
-            '[screen_nits]\ninternal = 400\n"Optix G241VC" = 260\n"ARZOPA" = 300\n')
-        self.assertEqual(settings["TOUCHPAD_NAME"], "ASUE140D:00.*Touchpad")
+            'touchpad_name = "ELAN1203:00.*Touchpad"\nsensitivity = 0.02\n'
+            '[screen_nits]\ninternal = 400\n"DELL U2720Q" = 260\n"LG HDR 4K" = 300\n')
+        self.assertEqual(settings["TOUCHPAD_NAME"], "ELAN1203:00.*Touchpad")
         self.assertEqual(settings["SENSITIVITY"], 0.02)
-        # the old longer name replaces the G241VC seed rather than duplicating it
-        self.assertEqual(nits, {"internal": 400, "Optix G241VC": 260, "ARZOPA": 300})
+        self.assertEqual(nits, {"internal": 400, "DELL U2720Q": 260, "LG HDR 4K": 300})
         self.assertIn("sensitivity = 0.02", text)
 
+    def test_old_toml_without_tomllib_reads_the_same(self):
+        text = ('# old\ntouchpad_name = "ELAN.*Touchpad"   # mine\nsensitivity = 0.02\n'
+                'remember_brightness = false\n\n[screen_nits]\ninternal = 400\n'
+                '"DELL U2720Q" = 260    # measured\n')
+        self.assertEqual(te._simple_toml(text), {
+            "touchpad_name": "ELAN.*Touchpad", "sensitivity": "0.02",
+            "remember_brightness": "false",
+            "screen_nits": {"internal": "400", "DELL U2720Q": "260"}})
+        path = self.tmp / "old.toml"
+        path.write_text(text)
+        with mock.patch.dict(sys.modules, {"tomllib": None}):   # Python < 3.11
+            settings, nits = te.parse_old_config(path)
+        self.assertEqual(settings, {"TOUCHPAD_NAME": "ELAN.*Touchpad", "SENSITIVITY": 0.02,
+                                    "REMEMBER_BRIGHTNESS": False})
+        self.assertEqual(nits, {"internal": 400.0, "DELL U2720Q": 260.0})
+
     def test_migrate_carries_old_script_nits(self):
-        (_, nits), _ = self.migrate(old_nits={"internal": 450, "ARZOPA": 320})
-        self.assertEqual(nits, {"internal": 450, "ARZOPA": 320, "G241VC": 250})
+        (_, nits), _ = self.migrate(old_nits={"internal": 450, "LG HDR 4K": 320})
+        self.assertEqual(nits, {"internal": 450, "LG HDR 4K": 320})
 
     def test_script_nits_reads_installed_copy(self):
         script = self.tmp / "old.py"
-        script.write_text('X = 1\nSCREEN_NITS = {\n    "internal": 400,\n    "ARZOPA": 300,\n}\n')
-        self.assertEqual(te.script_nits(script), {"internal": 400, "ARZOPA": 300})
+        script.write_text('X = 1\nSCREEN_NITS = {\n    "internal": 400,\n    "LG HDR 4K": 300,\n}\n')
+        self.assertEqual(te.script_nits(script), {"internal": 400, "LG HDR 4K": 300})
         self.assertEqual(te.script_nits(self.tmp / "missing.py"), {})
 
 
 DDCUTIL_DETECT = """Display 1
    I2C bus:  /dev/i2c-4
    DRM connector:           card1-DP-2
-   Monitor:                 MSI:Optix G241VC:
+   Monitor:                 DEL:DELL U2720Q:
 Display 2
    I2C bus:  /dev/i2c-7
    DRM connector:           card1-HDMI-A-1
-   Monitor:                 ARZ:ARZOPA:
+   Monitor:                 GSM:LG HDR 4K:
 
 Invalid display
    I2C bus:  /dev/i2c-9
@@ -275,14 +307,14 @@ Invalid display
 Display 3
    I2C bus:  /dev/i2c-2
    DRM connector:           card1-eDP-1
-   Monitor:                 SDC:ATNA40YK:
+   Monitor:                 BOE:0x0BCA:
 """
 
 
 class DdcutilTest(unittest.TestCase):
     def test_parse_detect(self):
         self.assertEqual(te.parse_ddcutil_detect(DDCUTIL_DETECT),
-                         [("4", "MSI:Optix G241VC:"), ("7", "ARZ:ARZOPA:")])
+                         [("4", "DEL:DELL U2720Q:"), ("7", "GSM:LG HDR 4K:")])
 
     def test_parse_empty(self):
         self.assertEqual(te.parse_ddcutil_detect("No displays found.\n"), [])
@@ -290,11 +322,107 @@ class DdcutilTest(unittest.TestCase):
 
     def test_peak_matching(self):
         reset_settings()
-        te.SCREEN_NITS = {"internal": 400, "ARZOPA": 300, "G241VC": 250}
+        te.SCREEN_NITS = {"internal": 400, "LG HDR 4K": 300, "U2720Q": 250}
         s = te.Screens(start=False)
-        self.assertEqual(s._peak_for("MSI:Optix G241VC:"), 250)
-        self.assertEqual(s._peak_for("ARZ:arzopa:"), 300)
-        self.assertIsNone(s._peak_for("DEL:U2720Q:"))
+        self.assertEqual(s._peak_for("DEL:DELL U2720Q:"), 250)
+        self.assertEqual(s._peak_for("GSM:lg hdr 4k:"), 300)
+        self.assertIsNone(s._peak_for("AUS:VG27A:"))
+
+
+def cta_edid(blocks):
+    """A 256-byte EDID with a CTA-861 extension holding the given data blocks."""
+    base = bytearray(128)
+    data = b"".join(blocks)
+    ext = bytearray(128)
+    ext[0], ext[1], ext[2] = 0x02, 3, 4 + len(data)
+    ext[4:4 + len(data)] = data
+    return bytes(base + ext)
+
+
+def hdr_block(max_lum, frame_avg=None):
+    payload = bytes([6, 0x05, 0x01, max_lum] + ([frame_avg] if frame_avg is not None else []))
+    return bytes([(7 << 5) | len(payload)]) + payload
+
+
+class MonitorTest(unittest.TestCase):
+    def test_hdr_peak_prefers_frame_average(self):
+        # code 115 = 50 * 2^(115/32) = 604 nits; 96 = 400 nits
+        self.assertEqual(te.edid_peak_nits(cta_edid([hdr_block(115, 96)])), 400)
+
+    def test_hdr_peak_max_luminance_only(self):
+        self.assertEqual(te.edid_peak_nits(cta_edid([hdr_block(115)])), 604)
+
+    def test_hdr_block_after_other_blocks(self):
+        audio = bytes([(1 << 5) | 3, 0x09, 0x07, 0x07])
+        self.assertEqual(te.edid_peak_nits(cta_edid([audio, hdr_block(96, 0)])), 400)
+
+    def test_sdr_monitor_reports_nothing(self):
+        audio = bytes([(1 << 5) | 3, 0x09, 0x07, 0x07])
+        self.assertIsNone(te.edid_peak_nits(cta_edid([audio])))
+        self.assertIsNone(te.edid_peak_nits(bytes(128)))
+        self.assertIsNone(te.edid_peak_nits(b""))
+
+    def test_monitor_model(self):
+        self.assertEqual(te.monitor_model("DEL:DELL U2720Q:"), "DELL U2720Q")
+        self.assertEqual(te.monitor_model("XYZ::"), "XYZ")
+
+    def test_match_peak(self):
+        # laptop at 160 nits; the monitor matched at 64% -> 250 nits peak
+        self.assertEqual(te.match_peak(160, 64), 250)
+        self.assertEqual(te.match_peak(160, 100), 160)
+
+    def test_uevent_socket_opens(self):
+        import socket
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, te.NETLINK_KOBJECT_UEVENT)
+        sock.bind((0, 1))
+        sock.close()
+
+    def test_uevent_hotplug(self):
+        msg = (b"change@/devices/pci0000:00/0000:00:08.1/0000:05:00.0/drm/card1\0"
+               b"ACTION=change\0DEVPATH=/devices/.../drm/card1\0SUBSYSTEM=drm\0"
+               b"HOTPLUG=1\0CONNECTOR=110\0SEQNUM=4242\0")
+        props = te.parse_uevent(msg)
+        self.assertEqual(props["CONNECTOR"], "110")
+        self.assertTrue(te.is_display_hotplug(props))
+        self.assertFalse(te.is_display_hotplug(te.parse_uevent(
+            b"change@/devices/x/power_supply/BAT0\0ACTION=change\0SUBSYSTEM=power_supply\0")))
+        self.assertFalse(te.is_display_hotplug(te.parse_uevent(
+            b"change@/devices/x/drm/card1\0ACTION=change\0SUBSYSTEM=drm\0")))
+
+    def test_plugged_monitor_gets_current_level_and_quick_retry(self):
+        reset_settings()
+        s = te.Screens(start=False)
+        s.live = True
+        s.known = 200.0
+        s.externals = [("4", 250)]
+        s.synced = {"4"}
+        s.names = {"4": "DEL:DELL U2720Q:", "7": "GSM:LG HDR 4K:"}
+        s.ddc_dead = {"7": 1e18}                  # failed while its DDC was waking up
+        pushed = []
+        with mock.patch.object(s, "_scan_sysfs", return_value=[("4", 250), ("7", None)]), \
+                mock.patch.object(s, "_set_ddc", lambda bus, pct: pushed.append((bus, pct)) or True), \
+                mock.patch.object(s, "_announce") as announce, \
+                mock.patch.object(te, "log"):
+            s._on_hotplug()
+        self.assertEqual(pushed, [("7", 50)])     # 200 nits on an unrated (400) monitor
+        announce.assert_called_once_with("GSM:LG HDR 4K:")
+        self.assertIn("7", s.synced)
+
+    def test_announce_once(self):
+        reset_settings()
+        s = te.Screens(start=False)
+        s.announced = set()
+        u = te.Session(1000, "alice")
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(te, "MONITORS_FILE", str(Path(d, "m.json"))), \
+                mock.patch.object(te, "logged_in_user", lambda: u), \
+                mock.patch.object(te.shutil, "which", lambda c: "/usr/bin/" + c), \
+                mock.patch.object(te, "_run", return_value="") as run:
+            s._announce("GSM:LG HDR 4K:")
+            s._announce("GSM:LG HDR 4K:")
+            self.assertEqual(te.load_announced(), {"GSM:LG HDR 4K:"})
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("New monitor: LG HDR 4K", run.call_args.args[0])
 
 
 class VolumeTest(unittest.TestCase):
@@ -328,7 +456,7 @@ class VolumeTest(unittest.TestCase):
         self.assertEqual(te.parse_pactl_volume(vol, "Mute: yes\n"), (45, True))
 
     def user(self, desktop_proc=None, desktop=""):
-        u = te.Session(1000, "ferin", "2", "wayland", desktop)
+        u = te.Session(1000, "alice", "2", "wayland", desktop)
         te._proc_cache[1000] = (1e18, {desktop_proc} if desktop_proc else set())
         return u
 
@@ -358,7 +486,7 @@ class VolumeTest(unittest.TestCase):
     def test_runs_as_session_user_with_env(self):
         with mock.patch.object(te.os.path, "exists", lambda p: True):
             cmd = te.as_user(self.user(), "wpctl", "get-volume")
-        self.assertEqual(cmd[:4], ["runuser", "-u", "ferin", "--"])
+        self.assertEqual(cmd[:4], ["runuser", "-u", "alice", "--"])
         self.assertIn("XDG_RUNTIME_DIR=/run/user/1000", cmd)
         self.assertIn("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", cmd)
 
@@ -423,7 +551,7 @@ class PopupTest(unittest.TestCase):
 
     def test_notify_remembers_id_per_user_and_kind(self):
         te._notify.update(replace=True, ids={})
-        u = te.Session(1000, "ferin")
+        u = te.Session(1000, "alice")
         with mock.patch.object(te.shutil, "which", lambda c: "/usr/bin/notify-send"), \
                 mock.patch.object(te, "_run", return_value="42\n") as run:
             te.notify(u, "volume", 10)
@@ -433,7 +561,7 @@ class PopupTest(unittest.TestCase):
         self.assertEqual(second[second.index("-r") + 1], "42")
 
     def test_popup_per_desktop(self):
-        u = te.Session(1000, "ferin")
+        u = te.Session(1000, "alice")
         with mock.patch.object(te, "keys_possible", lambda: True):
             for proc, want in (("plasmashell", "Plasma OSD"), ("gnome-shell", "GNOME OSD"),
                                ("niri", "notify-send"), ("cinnamon", "notify-send")):

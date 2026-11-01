@@ -19,6 +19,7 @@ Every setting below can be overridden in /etc/trackpad-edges.conf
 
 Also usable by hand:
   sudo trackpad_edges.py --check       # what it found and how it will act
+  sudo trackpad_edges.py --match-monitors   # match external monitors by eye
   sudo trackpad_edges.py --status      # what nits each screen is at right now
   sudo trackpad_edges.py --calibrate   # re-fit the built-in panel's curve
 """
@@ -30,6 +31,7 @@ import os
 import pwd
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -89,6 +91,10 @@ BRIGHTNESS_STEP = 0.05   # each step = 5% of the slider
 MIN_BRIGHTNESS = 0.01    # dimmest allowed = 1% on the slider
 DDC_RETRY_BACKOFF = 30.0 # seconds to ignore a monitor whose setvcp keeps failing
 DDCUTIL_RESCAN = 300.0   # min seconds between slow `ddcutil detect` fallbacks
+# After a monitor is plugged in, look again this many seconds later: its
+# DDC/CI usually needs a moment before it accepts a brightness change.
+HOTPLUG_CHECKS = (1.0, 3.0, 6.0)
+MONITORS_FILE = "/var/lib/trackpad-edges/monitors.json"   # monitors already announced
 
 # ---- Remembering brightness ----
 REMEMBER_BRIGHTNESS = True
@@ -142,7 +148,7 @@ def parse_config(text, source="config"):
     Settings live in [settings] (or before any section); peak brightness in [nits].
     """
     cp = configparser.ConfigParser(default_section="__none__", interpolation=None,
-                                   inline_comment_prefixes=("#", ";"))
+                                   inline_comment_prefixes=("#", ";"), delimiters=("=",))
     cp.optionxform = str                          # keep monitor names as written
     cp.read_string("[settings]\n" + text, source=source)
     settings, nits = {}, {}
@@ -171,28 +177,48 @@ def parse_config(text, source="config"):
 def parse_old_config(path=OLD_CONFIG_FILE):
     """The pre-1.1 TOML config -> same shape as parse_config(), or None."""
     try:
-        import tomllib                            # Python 3.11+
-    except ImportError:
-        try:
-            import tomli as tomllib
-        except ImportError:
-            return None
+        text = Path(path).read_text()
+    except OSError:
+        return None
     try:
-        with open(path, "rb") as f:
-            cfg = tomllib.load(f)
-    except (OSError, ValueError):
+        import tomllib                            # Python 3.11+
+        cfg = tomllib.loads(text)
+    except ImportError:
+        cfg = _simple_toml(text)                  # older Pythons: the subset we wrote
+    except ValueError:
         return None
     settings, nits = {}, {}
     for key, value in cfg.items():
         name = key.upper()
         if name == "SCREEN_NITS" and isinstance(value, dict):
-            nits = {k: float(v) for k, v in value.items() if isinstance(v, (int, float))}
+            for k, v in value.items():
+                try:
+                    nits[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
         elif name in _CONFIGURABLE:
             try:
                 settings[name] = _convert(name, str(value))
             except ValueError:
                 pass
     return settings, nits
+
+
+def _simple_toml(text):
+    """`key = value` lines and [tables] of the old config, without tomllib."""
+    cfg = table = {}
+    for line in text.splitlines():
+        line = re.sub(r"\s+#.*$", "", line).strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"\[\s*([A-Za-z_]+)\s*\]$", line)
+        if m:
+            table = cfg.setdefault(m.group(1), {})
+            continue
+        if "=" in line:
+            key, value = (p.strip() for p in line.split("=", 1))
+            table[key.strip("\"'")] = value.strip("\"'")
+    return cfg
 
 
 def apply_config(settings, nits):
@@ -227,7 +253,7 @@ def load_config(path=None):
     log(f"loaded {path}")
 
 
-SEED_NITS = {"internal": 400, "ARZOPA": 300, "G241VC": 250}
+SEED_NITS = {"internal": 400}
 
 
 def render_config(template, settings, nits):
@@ -249,12 +275,35 @@ def render_config(template, settings, nits):
     return "\n".join(out) + "\n"
 
 
+def set_nits_line(text, key, value):
+    """Config text with `key = value` under [nits], keeping every other line as is."""
+    lines = text.splitlines()
+    line = f"{key} = {value}"
+    start = next((i for i, l in enumerate(lines) if l.strip().lower() == "[nits]"), None)
+    if start is None:
+        return text.rstrip("\n") + f"\n\n[nits]\n{line}\n"
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")),
+               len(lines))
+    last = start
+    for i in range(start + 1, end):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        last = i
+        if stripped.startswith(("#", ";")) or "=" not in stripped:
+            continue
+        if stripped.split("=", 1)[0].strip().strip("\"'").lower() == key.lower():
+            lines[i] = line
+            return "\n".join(lines) + "\n"
+    lines.insert(last + 1, line)
+    return "\n".join(lines) + "\n"
+
+
 def migrate_config(template_path, out_path, extra_nits=None):
     """Write out_path from the example, carrying over the old config's values.
 
     Nits come from the old TOML config and `extra_nits` (e.g. an older script's
-    built-in list); the seeds fill in only monitors none of those mention, so
-    "Optix G241VC" = 260 replaces the G241VC seed instead of sitting beside it.
+    built-in list); a seed is added only when none of those mention it.
     """
     settings, nits = parse_old_config() or ({}, {})
     nits = {**(extra_nits or {}), **nits}
@@ -922,12 +971,15 @@ def backlight():
 DRM_DIR = "/sys/class/drm"
 
 
-def edid_name(path):
-    """'MFG:Model' read from a monitor's EDID (same shape ddcutil prints)."""
+def read_edid(path):
     try:
-        edid = Path(path).read_bytes()
+        return Path(path).read_bytes()
     except OSError:
-        return ""
+        return b""
+
+
+def edid_name(edid):
+    """'MFG:Model' from a monitor's EDID bytes (same shape ddcutil prints)."""
     if len(edid) < 128:
         return ""
     m = (edid[8] << 8) | edid[9]
@@ -953,6 +1005,71 @@ def parse_ddcutil_detect(text):
         mon = re.search(r"Monitor:\s*(.+)", block)
         found.append((bus.group(1), mon.group(1).strip() if mon else ""))
     return found
+
+
+def edid_peak_nits(edid):
+    """Peak brightness an HDR monitor reports in its EDID, or None.
+
+    Reads the CTA-861 HDR static metadata block. "Max frame-average" is used
+    when present: it is what a full white (SDR) screen reaches, while "max
+    luminance" is a small HDR highlight. SDR monitors don't report either.
+    """
+    for off in range(128, len(edid) - 127, 128):
+        ext = edid[off:off + 128]
+        if ext[0] != 0x02 or not 4 <= ext[2] <= 127:   # CTA extension, data blocks end
+            continue
+        i = 4
+        while i < ext[2]:
+            tag, length = ext[i] >> 5, ext[i] & 0x1F
+            block = ext[i + 1:i + 1 + length]
+            if tag == 7 and length >= 4 and block[0] == 6:   # extended tag 6 = HDR static
+                # [6, EOTFs, metadata types, max luminance, max frame-average, min]
+                for k in (4, 3):
+                    if k < len(block) and block[k]:
+                        return round(50 * 2 ** (block[k] / 32))
+                return None
+            i += 1 + length
+    return None
+
+
+def monitor_model(name):
+    """'DEL:DELL U2720Q:' -> 'DELL U2720Q' (a config-friendly key), else the whole name."""
+    parts = [p.strip() for p in name.split(":")]
+    return (parts[1] if len(parts) > 1 and parts[1] else name.replace(":", " ")).strip()
+
+
+def load_announced():
+    try:
+        return set(json.loads(Path(MONITORS_FILE).read_text())["announced"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
+
+
+def save_announced(names):
+    try:
+        Path(MONITORS_FILE).parent.mkdir(parents=True, exist_ok=True)
+        Path(MONITORS_FILE).write_text(json.dumps({"announced": sorted(names)}) + "\n")
+    except OSError as e:
+        log(f"could not save {MONITORS_FILE}: {e}")
+
+
+NETLINK_KOBJECT_UEVENT = 15                       # <linux/netlink.h>; Python lacks the name
+
+
+def parse_uevent(data):
+    """A kernel uevent datagram -> {KEY: value}."""
+    parts = data.split(b"\0")
+    props = {}
+    for part in parts[1:]:
+        if b"=" in part:
+            k, v = part.split(b"=", 1)
+            props[k.decode(errors="replace")] = v.decode(errors="replace")
+    return props
+
+
+def is_display_hotplug(props):
+    return props.get("SUBSYSTEM") == "drm" and (
+        props.get("HOTPLUG") == "1" or props.get("ACTION") in ("add", "remove"))
 
 
 class PanelCurve:
@@ -1136,6 +1253,12 @@ class Screens:
         self.wake = threading.Event()
         self.pending = 0
         self.externals = []          # [(i2c bus number, peak nits or None)]
+        self.names = {}               # {bus: 'MFG:Model'}
+        self.fresh = {}               # {bus: when it appeared} for quick DDC retries
+        self.hotplug_at = []          # times to look for plugged/unplugged monitors
+        self.watching = False         # kernel hotplug events are arriving
+        self.live = start             # the service itself, not --check or --status
+        self.announced = load_announced() if start else set()
         self.scan_how = None
         self.last_scan = 0.0
         self.last_ddcutil = -DDCUTIL_RESCAN
@@ -1152,6 +1275,47 @@ class Screens:
         self.asleep_for = self._suspended()
         if start:
             threading.Thread(target=self._worker, daemon=True).start()
+            threading.Thread(target=self._watch_hotplug, daemon=True).start()
+
+    def _watch_hotplug(self):
+        """Wake up the moment a display is plugged or unplugged (no polling)."""
+        try:
+            sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM,
+                                 NETLINK_KOBJECT_UEVENT)
+            sock.bind((0, 1))                     # group 1 = the kernel's uevents
+        except (OSError, AttributeError) as e:
+            log(f"no hotplug events ({e}); looking for monitors every 15s instead")
+            return
+        self.watching = True
+        while True:
+            try:
+                props = parse_uevent(sock.recv(65536))
+            except OSError:                       # buffer overrun: something changed
+                props = {"SUBSYSTEM": "drm", "HOTPLUG": "1"}
+            if is_display_hotplug(props):
+                self.request_hotplug()
+
+    def request_hotplug(self):
+        now = time.time()
+        with self.lock:
+            self.hotplug_at += [now + d for d in HOTPLUG_CHECKS]
+        self.wake.set()
+
+    def _on_hotplug(self):
+        found = self._scan_sysfs()
+        if found != self.externals:
+            self._set_externals(found, "sysfs (hotplug)")
+        self.last_scan = time.time()
+        for bus, since in list(self.fresh.items()):
+            if time.time() - since > 15:
+                del self.fresh[bus]
+            elif bus not in self.synced:          # its DDC/CI may just not be up yet
+                self.ddc_dead.pop(bus, None)
+                self.ddc_fails.pop(bus, None)
+        bl = backlight()
+        t = self.known if self.known is not None else (self._panel_nits(bl) if bl else None)
+        if t is not None:
+            self._push_all(t, only_unsynced=True)
 
     def step(self, direction):
         with self.lock:
@@ -1190,6 +1354,8 @@ class Screens:
                 n, self.pending = self.pending, 0
                 due = any(t <= now for t in self.restore_at)
                 self.restore_at = [t for t in self.restore_at if t > now]
+                plugged = any(t <= now for t in self.hotplug_at)
+                self.hotplug_at = [t for t in self.hotplug_at if t > now]
             try:
                 if n:
                     self.apply(n)
@@ -1197,6 +1363,8 @@ class Screens:
                     self.restore()
                 elif REMEMBER_BRIGHTNESS:
                     self._housekeeping(now)
+                if plugged:
+                    self._on_hotplug()
             except Exception as e:
                 log(f"brightness error: {e!r}")   # never let the worker die
 
@@ -1237,7 +1405,7 @@ class Screens:
                 self.known = t
                 self._remember(t)
 
-        if now - self.last_scan > 15 and self.scan_how != "ddcutil detect":
+        if not self.watching and now - self.last_scan > 15 and self.scan_how != "ddcutil detect":
             found = self._scan_sysfs()            # cheap; catches a monitor plugged in
             if found != self.externals:
                 self._set_externals(found, "sysfs")
@@ -1279,10 +1447,30 @@ class Screens:
     def _set_externals(self, found, how):
         if found != self.externals or how != self.scan_how:
             log(f"external monitors found via {how}: {found}")
+        old = {bus for bus, _ in self.externals}
         self.externals, self.scan_how = found, how
         buses = {bus for bus, _ in found}
+        for bus, peak in found:
+            if bus not in old:
+                self.fresh[bus] = time.time()
+                if peak is None and self.live:
+                    self._announce(self.names.get(bus, ""))
         self.synced &= buses                      # an unplugged one needs a resync
         self.ddc_fails = {b: n for b, n in self.ddc_fails.items() if b in buses}
+
+    def _announce(self, name):
+        """Once per monitor ever: suggest --match-monitors for one we can't rate."""
+        if not name or name in self.announced or POPUP == "none":
+            return
+        user = logged_in_user()
+        if not user or not shutil.which("notify-send"):
+            return                                # try again next time it's plugged in
+        _run(as_user(user, "notify-send", "-a", "trackpad-edges", "-i", "video-display",
+                     f"New monitor: {monitor_model(name)}",
+                     "Its brightness already follows the laptop. To match it by eye, run:\n"
+                     "sudo trackpad_edges.py --match-monitors"), timeout=3)
+        self.announced.add(name)
+        save_announced(self.announced)
 
     def _scan_sysfs(self):
         """Find connected external screens straight from the kernel (no ddcutil needed)."""
@@ -1308,7 +1496,10 @@ class Screens:
                         break
             if bus is None:
                 continue
-            found.append((bus, self._peak_for(edid_name(Path(conn, "edid")))))
+            edid = read_edid(Path(conn, "edid"))
+            name = edid_name(edid)
+            self.names[bus] = name
+            found.append((bus, self._peak_for(name) or edid_peak_nits(edid)))
         return found
 
     def _scan_ddcutil(self):
@@ -1318,7 +1509,10 @@ class Screens:
         except (OSError, subprocess.SubprocessError) as e:
             log(f"ddcutil detect could not run: {e}")
             return []
-        found = [(bus, self._peak_for(name)) for bus, name in parse_ddcutil_detect(r.stdout)]
+        found = []
+        for bus, name in parse_ddcutil_detect(r.stdout):
+            self.names[bus] = name
+            found.append((bus, self._peak_for(name)))
         if not found:
             log(f"ddcutil detect saw no monitors. stdout={r.stdout[:300]!r} stderr={r.stderr[:300]!r}")
         return found
@@ -1342,6 +1536,10 @@ class Screens:
 
     def _maybe_rescan(self):
         now = time.time()
+        if self.watching:                         # hotplug events keep the list current
+            if now - self.last_scan > DDCUTIL_RESCAN:
+                self._scan()
+            return
         if now - self.last_scan > 60 or (not self.externals and now - self.last_scan > 10):
             self._scan()
 
@@ -1624,6 +1822,102 @@ def main():
         time.sleep(1)
 
 
+def read_key(fd):
+    """One keypress from a cbreak-mode terminal -> 'up', 'down', 'left', 'right', 'enter', or the char."""
+    data = os.read(fd, 8)
+    return {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1b[C": "right", b"\x1b[D": "left",
+            b"\n": "enter", b"\r": "enter", b"+": "up", b"=": "up", b"-": "down",
+            b"k": "up", b"j": "down"}.get(data, data.decode(errors="ignore").lower())
+
+
+def match_peak(target, pct):
+    """Peak nits of a monitor that looks like `target` nits at `pct`% (rounded to 5)."""
+    return int(round(target / (pct / 100) / 5) * 5)
+
+
+def match_monitors():
+    """Match each external monitor to the laptop by eye and save its peak nits."""
+    import termios
+    import tty
+    if os.geteuid() != 0:
+        print("run it as root: sudo trackpad_edges.py --match-monitors")
+        return 2
+    if not sys.stdin.isatty():
+        print("--match-monitors needs a terminal to read the arrow keys")
+        return 2
+    bl = backlight()
+    if bl is None:
+        print("no laptop panel found to match against")
+        return 1
+    screens = Screens(start=False)
+    screens._scan()
+    if not screens.externals:
+        print("No DDC/CI monitor found. Turn on DDC/CI in the monitor's menu and check "
+              "`sudo ddcutil detect`.")
+        return 1
+
+    service = subprocess.run(["systemctl", "is-active", "--quiet", "trackpad-edges"]).returncode == 0
+    if service:                                   # so it doesn't react to what we change
+        subprocess.run(["systemctl", "stop", "trackpad-edges"])
+    fd = sys.stdin.fileno()
+    term = termios.tcgetattr(fd)
+    original = screens._panel_nits(bl)
+    results = []
+    try:
+        if brightness_method(logged_in_user()) == "keys":
+            target = original                     # GNOME owns the panel: match it as is
+        else:
+            target = SCREEN_NITS["internal"] * 0.4
+            screens._drive(bl, target)
+        print(f"Laptop panel is at about {target:.0f} nits.\n"
+              "For each monitor, make it look as bright as the laptop screen\n"
+              "(look at something white on both).\n"
+              "  up/down = 1%   left/right = 5%   Enter = save   s = skip   q = quit\n")
+        tty.setcbreak(fd)
+        for bus, peak in screens.externals:
+            name = screens.names.get(bus, "") or f"i2c-{bus}"
+            pct = _get_vcp(bus)
+            if pct is None:
+                print(f"{monitor_model(name)}: can't read its brightness over DDC/CI, skipped")
+                continue
+            while True:
+                print(f"\r  {monitor_model(name)}: {pct:3d}%  ", end="", flush=True)
+                key = read_key(fd)
+                step = {"up": 1, "down": -1, "right": 5, "left": -5}.get(key)
+                if step:
+                    pct = max(1, min(100, pct + step))
+                    screens._set_ddc(bus, pct)
+                elif key == "enter":
+                    nits = match_peak(target, pct)
+                    print(f"-> {nits} nits" + ("  (at 100%: it may be dimmer still)" if pct == 100 else ""))
+                    results.append((monitor_model(name), nits))
+                    break
+                elif key in ("s", "q"):
+                    print("skipped")
+                    break
+            if key == "q":
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, term)
+        if original is not None and target != original:
+            screens._drive(bl, original)          # put the panel back
+        if results:
+            try:
+                text = Path(CONFIG_FILE).read_text()
+            except FileNotFoundError:
+                text = ""
+            for key, nits in results:
+                text = set_nits_line(text, key, nits)
+            parse_config(text, CONFIG_FILE)       # never write something we can't read
+            Path(CONFIG_FILE).write_text(text)
+            print(f"\nSaved to [nits] in {CONFIG_FILE}:")
+            for key, nits in results:
+                print(f"  {key} = {nits}")
+        if service:
+            subprocess.run(["systemctl", "start", "trackpad-edges"])
+    return 0
+
+
 def check():
     """Print what was detected and how each edge will act. Changes nothing."""
     def row(label, value):
@@ -1659,7 +1953,10 @@ def check():
     mons._scan()
     if mons.externals:
         for bus, peak in mons.externals:
-            row("monitor", f"i2c-{bus}  peak {f'{peak:g} nits' if peak else 'unlisted (as bright as the panel)'}")
+            name = monitor_model(mons.names.get(bus, "")) or "?"
+            row("monitor", f"{name} (i2c-{bus})  peak " + (
+                f"{peak:g} nits" if peak else
+                "unknown: treated as bright as the panel; sudo trackpad_edges.py --match-monitors"))
     else:
         row("monitor", "no DDC/CI monitor found" + ("" if shutil.which("ddcutil") else " (ddcutil not installed)"))
     if not glob.glob("/dev/i2c-*"):
@@ -1713,10 +2010,11 @@ def script_nits(path):
     return {}
 
 
-USAGE = """usage: trackpad_edges.py [--check | --status | --calibrate]
-  --check      show the touchpad, screens, session and methods it will use
-  --status     show each screen's brightness in nits
-  --calibrate  re-measure the laptop panel's brightness curve"""
+USAGE = """usage: trackpad_edges.py [--check | --match-monitors | --status | --calibrate]
+  --check           show the touchpad, screens, session and methods it will use
+  --match-monitors  match each external monitor to the laptop by eye
+  --status          show each screen's brightness in nits
+  --calibrate       re-measure the laptop panel's brightness curve"""
 
 
 if __name__ == "__main__":
@@ -1734,6 +2032,8 @@ if __name__ == "__main__":
         sys.exit(check())
     if mode in ("--status", "-s"):
         sys.exit(status())
+    if mode == "--match-monitors":
+        sys.exit(match_monitors())
     if mode == "--calibrate":
         sys.exit(recalibrate())
     if mode in ("--help", "-h"):

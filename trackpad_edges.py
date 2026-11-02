@@ -30,8 +30,11 @@ import math
 import os
 import pwd
 import re
+import select
 import shutil
+import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -352,28 +355,37 @@ class EdgeSwipe:
         self.gesture = None
 
     def feed(self, ev):
-        if ev.type == ecodes.EV_ABS:
-            if ev.code == ecodes.ABS_MT_POSITION_X:
-                self.x = ev.value
-            elif ev.code == ecodes.ABS_MT_POSITION_Y:
-                self.y = ev.value
-        elif ev.type == ecodes.EV_KEY:
-            if ev.code == ecodes.BTN_TOUCH:
-                if ev.value:
+        self.event(ev.type, ev.code, ev.value)
+
+    def event(self, type_, code, value,
+              EV_ABS=ecodes.EV_ABS, EV_KEY=ecodes.EV_KEY, EV_SYN=ecodes.EV_SYN,
+              MT_X=ecodes.ABS_MT_POSITION_X, MT_Y=ecodes.ABS_MT_POSITION_Y,
+              BTN_TOUCH=ecodes.BTN_TOUCH, SYN_REPORT=ecodes.SYN_REPORT,
+              SYN_DROPPED=ecodes.SYN_DROPPED):
+        # Runs for every event the pad sends (hundreds a second while it's in
+        # use), so the codes are bound as defaults: local lookups are fastest.
+        if type_ == EV_ABS:
+            if code == MT_X:
+                self.x = value
+            elif code == MT_Y:
+                self.y = value
+        elif type_ == EV_SYN:
+            if code == SYN_REPORT:
+                self._frame()
+            elif code == SYN_DROPPED:
+                self.reset()
+        elif type_ == EV_KEY:
+            if code == BTN_TOUCH:
+                if value:
                     self.touching = True
                     self.new_touch = True
                 else:
                     self.reset()
-            elif ev.code in self.MULTI_KEYS:
-                if ev.value:
-                    self.multi_keys.add(ev.code)
+            elif code in self.MULTI_KEYS:
+                if value:
+                    self.multi_keys.add(code)
                 else:
-                    self.multi_keys.discard(ev.code)
-        elif ev.type == ecodes.EV_SYN:
-            if ev.code == ecodes.SYN_DROPPED:
-                self.reset()
-            elif ev.code == ecodes.SYN_REPORT:
-                self._frame()
+                    self.multi_keys.discard(code)
 
     def _frame(self):
         if self.new_touch:                        # a fresh touch starts clean
@@ -438,17 +450,20 @@ _children = []
 _children_lock = threading.Lock()
 
 
-def _spawn(cmd):
+def _spawn(cmd, **kw):
     with _children_lock:
         _children[:] = [p for p in _children if p.poll() is None]   # reap finished
-        _children.append(subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        try:
+            _children.append(subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw))
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"could not run {cmd[0]}: {e}")
 
 
-def _run(cmd, timeout=5):
+def _run(cmd, timeout=5, **kw):
     """Run cmd and return its stdout, or None if it failed."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -519,27 +534,30 @@ def logged_in_user():
     """The active session on seat0 (multi-user and lingering-user safe), else None."""
     stamp, now = _logind_stamp(), time.time()
     c = _session_cache
-    if stamp != c["stamp"] or now - c["at"] > 60 or None in stamp:
+    if stamp != c["stamp"] or now - c["at"] > 60:
         c["session"], c["stamp"], c["at"] = _query_session(), stamp, now
     return c["session"]
 
 
-_proc_cache = {}                                  # {uid: (checked at, {comm, ...})}
+_proc_cache = {"at": 0.0, "by_uid": {}}          # {uid: {comm, ...}} from the last walk
 
 
 def user_processes(uid, max_age=30):
-    """Names of the processes `uid` runs (cached; one /proc walk, no subprocess)."""
-    at, names = _proc_cache.get(uid, (0.0, set()))
-    if time.time() - at > max_age:
-        names = set()
-        for d in glob.glob("/proc/[0-9]*"):
-            try:
-                if os.stat(d).st_uid == uid:
-                    names.add(Path(d, "comm").read_text().strip())
-            except OSError:
-                continue
-        _proc_cache[uid] = (time.time(), names)
-    return names
+    """Names of the processes `uid` runs (one cached /proc walk for all users)."""
+    if time.time() - _proc_cache["at"] > max_age:
+        by_uid = {}
+        with os.scandir("/proc") as it:
+            for entry in it:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    owner = entry.stat().st_uid
+                    with open(f"/proc/{entry.name}/comm") as f:
+                        by_uid.setdefault(owner, set()).add(f.read().strip())
+                except OSError:
+                    continue                      # exited while we looked
+        _proc_cache["by_uid"], _proc_cache["at"] = by_uid, time.time()
+    return _proc_cache["by_uid"].get(uid, set())
 
 
 # process name -> desktop; checked first because logind's Desktop= is the
@@ -594,18 +612,55 @@ def session_bus(uid):
     return f"unix:path=/run/user/{uid}/bus"
 
 
-def as_user(user, *cmd):
+def user_env(user):
+    """Environment for a command run in the user's desktop session."""
     uid, name = user[0], user[1]
+    try:
+        home = pwd.getpwuid(uid).pw_dir
+    except KeyError:
+        home = "/"
+    return {"PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin",
+            "HOME": home, "USER": name, "LOGNAME": name, "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "DBUS_SESSION_BUS_ADDRESS": session_bus(uid), "XDG_RUNTIME_DIR": f"/run/user/{uid}"}
+
+
+def as_user(user, *cmd):
+    """(argv, Popen keywords) that run cmd as the session user.
+
+    Python 3.9+ switches user in the forked child itself: one exec and no
+    PAM session, about 6x cheaper than `runuser` (which also logs two
+    journal lines per call). Older Pythons fall back to runuser.
+    """
+    uid, name = user[0], user[1]
+    env = user_env(user)
+    if sys.version_info >= (3, 9):
+        try:
+            gid = pwd.getpwuid(uid).pw_gid
+            return list(cmd), {"user": uid, "group": gid, "env": env, "cwd": "/",
+                               "extra_groups": os.getgrouplist(name, gid)}
+        except (KeyError, OSError):
+            pass
     return ["runuser", "-u", name, "--", "env",
-            f"DBUS_SESSION_BUS_ADDRESS={session_bus(uid)}",
-            f"XDG_RUNTIME_DIR=/run/user/{uid}", *cmd]
+            *(f"{k}={v}" for k, v in env.items()), *cmd], {}
+
+
+def run_as(user, *cmd, timeout=5):
+    """Run cmd as the session user; its stdout, or None if it failed."""
+    argv, kw = as_user(user, *cmd)
+    return _run(argv, timeout=timeout, **kw)
+
+
+def spawn_as(user, *cmd):
+    """Start cmd as the session user without waiting for it."""
+    argv, kw = as_user(user, *cmd)
+    _spawn(argv, **kw)
 
 
 def kde_shortcut(user, component, action):
-    _spawn(as_user(
+    spawn_as(
         user, "dbus-send", "--type=method_call", "--dest=org.kde.kglobalaccel",
         f"/component/{component}",
-        "org.kde.kglobalaccel.Component.invokeShortcut", f"string:{action}"))
+        "org.kde.kglobalaccel.Component.invokeShortcut", f"string:{action}")
 
 
 # ---- media keys (GNOME) ----
@@ -681,8 +736,8 @@ def notify(user, kind, percent, muted=False):
     if _notify["replace"] is None:                # -p/-r need libnotify 0.7.10+
         _notify["replace"] = "--replace-id" in (_run(["notify-send", "--help"]) or "")
     key = (user[0], kind)
-    out = _run(as_user(user, *notify_command(kind, percent, muted, _notify["ids"].get(key),
-                                             _notify["replace"])), timeout=3)
+    out = run_as(user, *notify_command(kind, percent, muted, _notify["ids"].get(key),
+                                       _notify["replace"]), timeout=3)
     if out and out.strip().isdigit():
         _notify["ids"][key] = int(out.strip())
 
@@ -751,12 +806,11 @@ def volume_commands(method, n, current=None):
 
 def read_volume(user, method):
     if method == "wpctl":
-        return parse_wpctl_volume(_run(as_user(user, "wpctl", "get-volume",
-                                               "@DEFAULT_AUDIO_SINK@")))
+        return parse_wpctl_volume(run_as(user, "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"))
     if method == "pactl":
         return parse_pactl_volume(
-            _run(as_user(user, "pactl", "get-sink-volume", "@DEFAULT_SINK@")),
-            _run(as_user(user, "pactl", "get-sink-mute", "@DEFAULT_SINK@")))
+            run_as(user, "pactl", "get-sink-volume", "@DEFAULT_SINK@"),
+            run_as(user, "pactl", "get-sink-mute", "@DEFAULT_SINK@"))
     return None
 
 
@@ -802,7 +856,7 @@ class Volume:
             return
         current = read_volume(user, method) if method == "pactl" else None
         for cmd in volume_commands(method, n, current and current[0]):
-            _run(as_user(user, *cmd))
+            run_as(user, *cmd)
         if POPUP != "none":
             now = read_volume(user, method)
             if now:
@@ -844,10 +898,10 @@ def show_osd(percent):
     if not user or POPUP == "none":
         return
     if plasma_running(user[0]):
-        _spawn(as_user(
+        spawn_as(
             user, "dbus-send", "--type=method_call", "--dest=org.kde.plasmashell",
             "/org/kde/osdService", "org.kde.osdService.brightnessChanged",
-            f"int32:{percent}"))
+            f"int32:{percent}")
     else:
         notify(user, "brightness", percent)
 
@@ -855,10 +909,8 @@ def show_osd(percent):
 def kde_internal_display(user):
     """D-Bus path of Plasma's built-in screen (org.kde.ScreenBrightness), or None."""
     def call(*args):
-        r = subprocess.run(as_user(user, "dbus-send", "--print-reply",
-                                   "--dest=org.kde.ScreenBrightness", *args),
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout if r.returncode == 0 else ""
+        return run_as(user, "dbus-send", "--print-reply",
+                      "--dest=org.kde.ScreenBrightness", *args) or ""
 
     out = call("/org/kde/ScreenBrightness", "org.freedesktop.DBus.Properties.Get",
                "string:org.kde.ScreenBrightness", "string:DisplaysDBusNames")
@@ -887,21 +939,16 @@ def sync_kde(fraction):
     user = logged_in_user()
     if not user or not plasma_running(user[0]):
         return False
-    try:
-        path = _kde_displays.get(user[0]) or kde_internal_display(user)
-        if not path:
-            return False
-        r = subprocess.run(as_user(                # flags=1: no OSD popup
-            user, "dbus-send", "--print-reply", "--dest=org.kde.ScreenBrightness",
-            path, "org.kde.ScreenBrightness.Display.SetBrightness",
-            f"int32:{round(fraction * 10000)}", "uint32:1"),
-            capture_output=True, timeout=5)
-        if r.returncode == 0:
-            _kde_displays[user[0]] = path
-            return True
-        _kde_displays.pop(user[0], None)           # display renumbered: look it up again
-    except (OSError, subprocess.SubprocessError) as e:
-        log(f"could not update Plasma's brightness: {e}")
+    path = _kde_displays.get(user[0]) or kde_internal_display(user)
+    if not path:
+        return False
+    if run_as(user, "dbus-send", "--print-reply",          # flags=1: no OSD popup
+              "--dest=org.kde.ScreenBrightness", path,
+              "org.kde.ScreenBrightness.Display.SetBrightness",
+              f"int32:{round(fraction * 10000)}", "uint32:1") is not None:
+        _kde_displays[user[0]] = path
+        return True
+    _kde_displays.pop(user[0], None)               # display renumbered: look it up again
     return False
 
 
@@ -954,8 +1001,19 @@ def write_kwin_brightness(fraction):
             tmp.unlink(missing_ok=True)
 
 
+_backlight = {"path": None}
+
+
 def backlight():
     """Path of the best backlight device for the built-in panel, or None."""
+    cached = _backlight["path"]
+    if cached is not None and cached.exists():
+        return cached
+    _backlight["path"] = _find_backlight()
+    return _backlight["path"]
+
+
+def _find_backlight():
     best = None
     for bl in glob.glob("/sys/class/backlight/*"):
         try:
@@ -1347,7 +1405,12 @@ class Screens:
             # systemd-backlight restores its own value after we start
             self.request_restore((0.0, 5.0))
         while True:
-            self.wake.wait(timeout=POLL_INTERVAL)
+            with self.lock:
+                due_times = self.restore_at + self.hotplug_at
+            timeout = POLL_INTERVAL
+            if due_times:                         # wake exactly when the next check is due
+                timeout = max(0.0, min(timeout, min(due_times) - time.time()))
+            self.wake.wait(timeout=timeout)
             self.wake.clear()
             now = time.time()
             with self.lock:
@@ -1404,6 +1467,10 @@ class Screens:
             elif abs(t - self.known) > SCREEN_NITS["internal"] * 0.01:
                 self.known = t
                 self._remember(t)
+                if brightness_method(user) != "kde":
+                    # brightness keys or the desktop's slider moved the panel:
+                    # bring the monitors along (Plasma drives its own monitors)
+                    self.synced.clear()
 
         if not self.watching and now - self.last_scan > 15 and self.scan_how != "ddcutil detect":
             found = self._scan_sysfs()            # cheap; catches a monitor plugged in
@@ -1412,6 +1479,16 @@ class Screens:
             self.last_scan = now
         if self.known is not None:
             self._push_all(self.known, only_unsynced=True)
+
+    def flush(self):
+        """Write a pending brightness save now (the service is stopping)."""
+        if self.save_at and self.saved is not None:
+            self.save_at = None
+            save_state(self.saved)
+            try:
+                self._sync_kwin_files()
+            except Exception as e:
+                log(f"could not update KWin's saved brightness: {e!r}")
 
     def _sync_kwin_files(self):
         """Saved level -> KWin's config of every user not in a Plasma session."""
@@ -1465,10 +1542,10 @@ class Screens:
         user = logged_in_user()
         if not user or not shutil.which("notify-send"):
             return                                # try again next time it's plugged in
-        _run(as_user(user, "notify-send", "-a", "trackpad-edges", "-i", "video-display",
-                     f"New monitor: {monitor_model(name)}",
-                     "Its brightness already follows the laptop. To match it by eye, run:\n"
-                     "sudo trackpad_edges.py --match-monitors"), timeout=3)
+        run_as(user, "notify-send", "-a", "trackpad-edges", "-i", "video-display",
+               f"New monitor: {monitor_model(name)}",
+               "Its brightness already follows the laptop. To match it by eye, run:\n"
+               "sudo trackpad_edges.py --match-monitors", timeout=3)
         self.announced.add(name)
         save_announced(self.announced)
 
@@ -1794,10 +1871,43 @@ def axis_range(info):
     return info.min, info.max
 
 
+INPUT_EVENT = struct.Struct("llHHi")              # struct input_event: timeval, type, code, value
+
+
+def pump(fd, handle):
+    """Feed each raw event from an evdev fd to handle(type, code, value) until it fails.
+
+    Unpacks the kernel's structs directly instead of building python-evdev
+    event objects: about 40% less CPU per event. Raises OSError when the
+    device goes away.
+    """
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    chunk = INPUT_EVENT.size * 64
+    while True:
+        poller.poll()                             # sleeps until the pad sends something
+        try:
+            data = os.read(fd, chunk)
+        except BlockingIOError:
+            continue
+        if not data:
+            raise OSError("input device closed")
+        for _sec, _usec, type_, code, value in INPUT_EVENT.iter_unpack(data):
+            handle(type_, code, value)
+
+
 def main():
     global screens
     load_config()
     screens = Screens()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # systemctl stop: clean exit
+    try:
+        run_touchpad()
+    finally:
+        screens.flush()                           # don't lose a brightness change
+
+
+def run_touchpad():
     waited = 0
     while True:
         found = find_touchpad()
@@ -1813,8 +1923,7 @@ def main():
         detector = EdgeSwipe(axis_range(axes[ecodes.ABS_MT_POSITION_X]),
                              axis_range(axes[ecodes.ABS_MT_POSITION_Y]), on_step)
         try:
-            for ev in dev.read_loop():
-                detector.feed(ev)
+            pump(dev.fd, detector.event)
         except OSError:
             pass                                  # device vanished (suspend/replug)
         finally:
@@ -1984,11 +2093,10 @@ def check():
 def notification_daemon(user):
     """True if something answers (or would be started for) org.freedesktop.Notifications."""
     def bus(method, *args):
-        return _run(as_user(user, "dbus-send", "--session", "--print-reply",
-                            "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
-                            f"org.freedesktop.DBus.{method}", *args)) or ""
+        return run_as(user, "busctl", "--user", "call", "org.freedesktop.DBus",
+                      "/org/freedesktop/DBus", "org.freedesktop.DBus", method, *args) or ""
     name = "org.freedesktop.Notifications"
-    return "true" in bus("NameHasOwner", f"string:{name}") or \
+    return bus("NameHasOwner", "s", name).strip() == "b true" or \
         f'"{name}"' in bus("ListActivatableNames")
 
 

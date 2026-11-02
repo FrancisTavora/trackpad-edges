@@ -7,6 +7,7 @@ pad, so the desktop never sees the fake swipes.
 import os
 import select
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -64,7 +65,10 @@ class KernelPathTest(unittest.TestCase):
         except OSError:
             pass
         self.dev.close()
-        self.pad.close()
+        try:
+            self.pad.close()
+        except OSError:
+            pass
         self.screen.close()
         te.TOUCHPAD_NAME = self.saved
 
@@ -120,6 +124,29 @@ class KernelPathTest(unittest.TestCase):
         self.assertEqual(len(up), len(down))
         self.assertEqual(corner, [])
         self.assertEqual(middle, [])
+
+
+    def test_service_reader_until_unplugged(self):
+        """pump() (what the service runs) sees the same swipe, and ends when the pad goes away."""
+        steps, ended = [], threading.Event()
+        det = te.EdgeSwipe(te.axis_range(self.axes[e.ABS_MT_POSITION_X]),
+                           te.axis_range(self.axes[e.ABS_MT_POSITION_Y]),
+                           lambda zone, d: steps.append((zone, d)))
+
+        def run():
+            try:
+                te.pump(self.dev.fd, det.event)
+            except OSError:
+                ended.set()                       # the service then looks for a pad again
+
+        threading.Thread(target=run, daemon=True).start()
+        h = Y[1] - Y[0]
+        self.swipe(X[0] + 100, Y[0] + int(h * 0.9), Y[0] + int(h * 0.3))
+        time.sleep(0.3)
+        self.pad.close()                          # unplug
+        self.assertTrue(ended.wait(3), "pump() did not notice the pad going away")
+        self.assertEqual(set(steps), {("LEFT", +1)})
+        self.assertTrue(28 <= len(steps) <= 32, len(steps))
 
 
 if __name__ == "__main__":

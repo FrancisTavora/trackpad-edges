@@ -457,7 +457,7 @@ class VolumeTest(unittest.TestCase):
 
     def user(self, desktop_proc=None, desktop=""):
         u = te.Session(1000, "alice", "2", "wayland", desktop)
-        te._proc_cache[1000] = (1e18, {desktop_proc} if desktop_proc else set())
+        te._proc_cache.update(at=1e18, by_uid={1000: {desktop_proc} if desktop_proc else set()})
         return u
 
     def which(self, *have):
@@ -484,24 +484,45 @@ class VolumeTest(unittest.TestCase):
             self.assertEqual(te.desktop_from_name(raw), want, raw)
 
     def test_runs_as_session_user_with_env(self):
-        with mock.patch.object(te.os.path, "exists", lambda p: True):
-            cmd = te.as_user(self.user(), "wpctl", "get-volume")
-        self.assertEqual(cmd[:4], ["runuser", "-u", "alice", "--"])
-        self.assertIn("XDG_RUNTIME_DIR=/run/user/1000", cmd)
-        self.assertIn("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", cmd)
+        u = self.user()
+        with mock.patch.object(te.os.path, "exists", lambda p: True), \
+                mock.patch.object(te.pwd, "getpwuid", lambda uid: mock.Mock(pw_gid=1000, pw_dir="/home/alice")), \
+                mock.patch.object(te.os, "getgrouplist", lambda name, gid: [1000, 994]):
+            argv, kw = te.as_user(u, "wpctl", "get-volume")
+            with mock.patch.object(te.sys, "version_info", (3, 8)):
+                old_argv, old_kw = te.as_user(u, "wpctl", "get-volume")
+        # Python 3.9+: switch user in the child, no runuser/PAM
+        self.assertEqual(argv, ["wpctl", "get-volume"])
+        self.assertEqual((kw["user"], kw["group"], kw["extra_groups"]), (1000, 1000, [1000, 994]))
+        self.assertEqual(kw["env"]["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(kw["env"]["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1000/bus")
+        self.assertEqual(kw["env"]["HOME"], "/home/alice")
+        # older Pythons: runuser with the same environment
+        self.assertEqual(old_argv[:4], ["runuser", "-u", "alice", "--"])
+        self.assertIn("XDG_RUNTIME_DIR=/run/user/1000", old_argv)
+        self.assertEqual(old_argv[-2:], ["wpctl", "get-volume"])
+        self.assertEqual(old_kw, {})
+
+    @unittest.skipUnless(os.geteuid() == 0, "switching user needs root (the service is root)")
+    def test_runs_for_real_as_another_user(self):
+        import pwd
+        nobody = pwd.getpwnam("nobody")
+        out = te.run_as(te.Session(nobody.pw_uid, "nobody"), "sh", "-c",
+                        'echo "$(id -u) $(id -g) $USER $XDG_RUNTIME_DIR"')
+        self.assertEqual(out, f"{nobody.pw_uid} {nobody.pw_gid} nobody /run/user/{nobody.pw_uid}\n")
 
     def test_apply_on_niri_runs_wpctl_then_popup(self):
         ran = []
 
-        def fake_run(cmd, timeout=5):
-            ran.append(cmd[cmd.index("--") + 4:])   # strip runuser/env prefix
+        def fake_run(user, *cmd, timeout=5):
+            ran.append(list(cmd))
             return "Volume: 0.55\n" if "get-volume" in cmd else ""
 
         u = self.user("niri")
         vol = te.Volume.__new__(te.Volume)
         with self.which("wpctl", "notify-send"), \
                 mock.patch.object(te, "logged_in_user", lambda: u), \
-                mock.patch.object(te, "_run", fake_run), \
+                mock.patch.object(te, "run_as", fake_run), \
                 mock.patch.object(te, "notify") as notify:
             vol.apply(+2)
         self.assertEqual(ran[0], ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
@@ -565,7 +586,7 @@ class PopupTest(unittest.TestCase):
         with mock.patch.object(te, "keys_possible", lambda: True):
             for proc, want in (("plasmashell", "Plasma OSD"), ("gnome-shell", "GNOME OSD"),
                                ("niri", "notify-send"), ("cinnamon", "notify-send")):
-                te._proc_cache[1000] = (1e18, {proc})
+                te._proc_cache.update(at=1e18, by_uid={1000: {proc}})
                 self.assertEqual(te.brightness_popup(u), want, proc)
         self.assertEqual(te.brightness_popup(None), "none")
         self.assertEqual(te.volume_popup("wpctl"), "notify-send")
